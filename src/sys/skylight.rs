@@ -350,7 +350,7 @@ unsafe extern "C" {
         y_offset: f32,
         shape: *mut CFType,
     ) -> CGError;
-    pub fn CGSOrderWindow(cid: cid_t, wid: u32, order: c_int, relative_to: u32) -> CGError;
+    pub fn SLSOrderWindow(cid: cid_t, wid: u32, order: c_int, relative_to: u32) -> CGError;
     pub fn SLSSetWindowTags(cid: cid_t, wid: u32, tags: *mut u64, tag_count: c_int) -> CGError;
     pub fn SLSClearWindowTags(cid: cid_t, wid: u32, tags: *mut u64, tag_count: c_int) -> CGError;
     pub fn CGSNewRegionWithRect(rect: *const CGRect, region: *mut *mut CFType) -> CGError;

@@ -5,8 +5,8 @@ use objc2_core_foundation::{CFNumber, CFRetained, CFString, CFType, CGPoint, CGR
 use objc2_core_graphics::CGError;
 
 use super::skylight::{
-    CGRegionCreateEmptyRegion, CGSNewRegionWithRect, CGSOrderWindow, G_CONNECTION,
-    SLSClearWindowTags, SLSNewWindowWithOpaqueShapeAndContext, SLSReleaseWindow, SLSSetWindowAlpha,
+    CGRegionCreateEmptyRegion, CGSNewRegionWithRect, G_CONNECTION, SLSClearWindowTags,
+    SLSNewWindowWithOpaqueShapeAndContext, SLSOrderWindow, SLSReleaseWindow, SLSSetWindowAlpha,
     SLSSetWindowBackgroundBlurRadiusStyle, SLSSetWindowLevel, SLSSetWindowOpacity,
     SLSSetWindowProperty, SLSSetWindowResolution, SLSSetWindowShape, SLSSetWindowSubLevel,
     SLSSetWindowTags, cid_t,
@@ -237,7 +237,7 @@ impl CgsWindow {
     pub fn order_above(&self, relative: Option<WindowId>) -> Result<(), CgsWindowError> {
         let rel = relative.unwrap_or(0);
         unsafe {
-            cg_ok(CGSOrderWindow(
+            cg_ok(SLSOrderWindow(
                 self.connection,
                 self.id,
                 1, // kCGSOrderAbove
@@ -250,7 +250,7 @@ impl CgsWindow {
     #[inline]
     pub fn order_out(&self) -> Result<(), CgsWindowError> {
         unsafe {
-            cg_ok(CGSOrderWindow(
+            cg_ok(SLSOrderWindow(
                 self.connection,
                 self.id,
                 0, // kCGSOrderOut
