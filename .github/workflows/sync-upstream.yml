@@ -1,0 +1,115 @@
+name: Sync with Upstream
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: acsandmann/rift
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream
+
+      - name: Check for new commits
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          LOCAL_SHA=$(git rev-parse origin/${{ env.TARGET_BRANCH }})
+          
+          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
+            echo "No new commits from upstream"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            COMMITS=$(git log --oneline origin/${{ env.TARGET_BRANCH }}..upstream/${{ env.UPSTREAM_BRANCH }} | wc -l)
+            echo "Found $COMMITS new commit(s) from upstream"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "commit_count=$COMMITS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attempt merge
+        id: merge
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git checkout ${{ env.TARGET_BRANCH }}
+          
+          # Try to merge upstream
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            # Abort the merge for now, we'll handle it in the next step
+            git merge --abort
+          fi
+
+      - name: Push merged changes
+        if: steps.merge.outputs.merge_success == 'true'
+        run: |
+          git push origin ${{ env.TARGET_BRANCH }}
+          echo "Successfully synced with upstream!"
+
+      - name: Create PR for conflict resolution
+        if: steps.merge.outputs.merge_success == 'false'
+        run: |
+          # Create a branch for conflict resolution
+          BRANCH_NAME="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b $BRANCH_NAME
+          
+          # Attempt merge again (this will leave conflicts)
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} || true
+          
+          # Check if there are actual conflicts
+          if git diff --check; then
+            echo "No conflicts, pushing branch"
+            git push origin $BRANCH_NAME
+            
+            gh pr create \
+              --title "Sync with upstream ${{ env.UPSTREAM_REPO }}" \
+              --body "Automatic sync with upstream. Please resolve any conflicts and merge." \
+              --base ${{ env.TARGET_BRANCH }} \
+              --head $BRANCH_NAME
+          else
+            echo "Conflicts detected, creating PR for manual resolution"
+            # Add conflict markers to the body
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            
+            git add -A
+            git commit -m "WIP: Sync with upstream (conflicts)" || true
+            git push origin $BRANCH_NAME
+            
+            gh pr create \
+              --title "🔄 Sync with upstream (conflicts need resolution)" \
+              --body "Automatic sync with upstream detected conflicts in: ${CONFLICT_FILES}
+
+            Please resolve conflicts and merge this PR.
+
+            **Upstream repository:** ${{ env.UPSTREAM_REPO }}
+            **Commits to sync:** ${{ steps.check.outputs.commit_count }}" \
+              --base ${{ env.TARGET_BRANCH }} \
+              --head $BRANCH_NAME
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
