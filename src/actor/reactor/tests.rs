@@ -613,3 +613,32 @@ fn display_churn_quarantines_window_frame_changed_events() {
         "WindowFrameChanged should be quarantined during churn"
     );
 }
+
+#[test]
+fn topology_relayout_pending_when_space_ids_change_for_same_displays() {
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1280., 800.));
+    let right = CGRect::new(CGPoint::new(1280., 0.), CGSize::new(1280., 800.));
+
+    reactor.handle_event(screen_params_event(
+        vec![left, right],
+        vec![Some(SpaceId::new(11)), Some(SpaceId::new(22))],
+        vec![],
+    ));
+    assert!(!reactor.pending_space_change_manager.topology_relayout_pending);
+
+    reactor.handle_event(screen_params_event(
+        vec![left, right],
+        vec![Some(SpaceId::new(111)), Some(SpaceId::new(222))],
+        vec![],
+    ));
+    assert!(
+        reactor.pending_space_change_manager.topology_relayout_pending,
+        "Space-id churn on unchanged displays should trigger topology relayout"
+    );
+}

@@ -57,7 +57,6 @@ use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt};
 pub use crate::sys::screen::ScreenInfo;
 use crate::sys::screen::{SpaceId, get_active_space_number, order_visible_spaces_by_position};
-use crate::sys::timer::Timer;
 use crate::sys::window_server::{
     self, WindowServerId, WindowServerInfo, current_cursor_location, space_is_fullscreen,
     wait_for_native_fullscreen_transition, window_level,
@@ -1249,7 +1248,7 @@ impl Reactor {
         for space in refresh_spaces {
             if let Some(track) = self.space_manager.fullscreen_by_space.remove(&space.get()) {
                 wait_for_native_fullscreen_transition();
-                Timer::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(50));
 
                 for window in track.windows {
                     if let Some(app) = self.app_manager.apps.get(&window.pid) {

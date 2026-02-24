@@ -28,7 +28,6 @@ use crate::sys::cg_ok;
 use crate::sys::dispatch::DispatchExt;
 use crate::sys::process::ProcessSerialNumber;
 use crate::sys::skylight::*;
-use crate::sys::timer::Timer;
 
 static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
@@ -631,7 +630,7 @@ pub fn space_is_fullscreen(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNE
 pub fn space_is_system(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 2 } }
 pub fn wait_for_native_fullscreen_transition() {
     while !space_is_user(unsafe { CGSGetActiveSpace(*G_CONNECTION) }) {
-        Timer::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

@@ -157,9 +157,13 @@ impl NotificationCenterInner {
         let name = &*notif.name();
         let span = info_span!("notification_center::handle_screen_changed_event", ?name);
         let _s = span.enter();
-        if unsafe { NSWorkspaceActiveSpaceDidChangeNotification } == name
-            || name.to_string() == "NSWorkspaceActiveDisplayDidChangeNotification"
-        {
+        if name.to_string() == "NSWorkspaceActiveDisplayDidChangeNotification" {
+            // Active display changes can happen without a space switch. Trigger a
+            // screen refresh so display UUID/geometry changes still flow through
+            // ScreenParametersChanged (needed for per-display gaps and mappings).
+            self.schedule_screen_refresh();
+            self.send_current_space();
+        } else if unsafe { NSWorkspaceActiveSpaceDidChangeNotification } == name {
             self.send_current_space();
         } else {
             warn!("Unexpected screen changed event: {notif:?}");

@@ -175,21 +175,41 @@ impl SpaceEventHandler {
     }
 
     pub fn handle_screen_parameters_changed(reactor: &mut Reactor, screens: Vec<ScreenInfo>) {
+        let previous_screens = reactor.space_manager.screens.clone();
         let previous_displays: HashSet<String> =
-            reactor.space_manager.screens.iter().map(|s| s.display_uuid.clone()).collect();
+            previous_screens.iter().map(|s| s.display_uuid.clone()).collect();
         let new_displays: HashSet<String> =
             screens.iter().map(|s| s.display_uuid.clone()).collect();
         let displays_changed = previous_displays != new_displays;
+        let display_order_changed = previous_screens
+            .iter()
+            .map(|s| s.display_uuid.as_str())
+            .ne(screens.iter().map(|s| s.display_uuid.as_str()));
+
+        let previous_spaces_by_display: HashMap<String, SpaceId> = previous_screens
+            .iter()
+            .filter_map(|screen| screen.space.map(|space| (screen.display_uuid.clone(), space)))
+            .collect();
+        let new_spaces_by_display: HashMap<String, SpaceId> = screens
+            .iter()
+            .filter_map(|screen| screen.space.map(|space| (screen.display_uuid.clone(), space)))
+            .collect();
+        let display_space_changed = previous_spaces_by_display.iter().any(|(display_uuid, space)| {
+            new_spaces_by_display
+                .get(display_uuid)
+                .is_some_and(|new_space| new_space != space)
+        });
 
         // IMPORTANT:
-        // Only treat display UUID set changes as a "topology change" once we have a prior known set.
-        // On startup (previous_displays is empty), we'll always see displays_changed=true, but that
-        // should not trigger topology relayout pending. If it does, we can get stuck in a state where
+        // Only treat display topology changes as such once we have a prior known set.
+        // On startup (previous_displays is empty), display/order/space changes should not
+        // trigger topology relayout pending. If they do, we can get stuck in a state where
         // SpaceChanged updates are suppressed/dropped around login window transitions.
         //
         // Once we've seen a non-empty display set, allow topology changes that pass through empty
         // (all displays unplugged/replugged).
-        let should_trigger_topology = displays_changed
+        let topology_changed = displays_changed || display_order_changed || display_space_changed;
+        let should_trigger_topology = topology_changed
             && (reactor.space_manager.has_seen_display_set || !previous_displays.is_empty());
 
         if displays_changed {
@@ -252,10 +272,16 @@ impl SpaceEventHandler {
 
             reactor.recompute_and_set_active_spaces(&spaces);
 
-            // Do not remap layout state across reconnects; new space ids can churn and
-            // remapping has caused windows to oscillate. Keep existing state and only
-            // update the screen→space mapping.
-            reactor.reconcile_spaces_with_display_history(&spaces, false);
+            // Only remap layout state during detected topology transitions once we have
+            // a complete, non-duplicated snapshot to avoid oscillation during churn.
+            let has_duplicate_spaces = {
+                let mut unique_spaces: HashSet<SpaceId> = HashSet::default();
+                spaces.iter().flatten().any(|space| !unique_spaces.insert(*space))
+            };
+            let allow_space_remap = should_trigger_topology
+                && !has_duplicate_spaces
+                && spaces.iter().all(|space| space.is_some());
+            reactor.reconcile_spaces_with_display_history(&spaces, allow_space_remap);
             if !resized_screens.is_empty() {
                 let resized_info: Vec<(SpaceId, CGSize)> = reactor
                     .space_manager
