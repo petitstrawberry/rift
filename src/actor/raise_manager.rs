@@ -83,32 +83,34 @@ impl RaiseManager {
         };
 
         loop {
-            if let Some(sequence) = &raise_manager.active_sequence {
-                timeout_timer.set_next_fire(sequence_timeout(sequence));
-                tokio::select! {
-                    maybe = rx.recv() => {
-                        let Some((span, msg)) = maybe else { break };
-                        let _guard = span.enter();
-                        raise_manager.handle_message(msg);
-                    }
-                    _ = timeout_timer.next() => {
-                        if let Some(sequence) = &mut raise_manager.active_sequence {
-                            if sequence_timeout(sequence) <= Duration::ZERO {
-                                // Send timeout event to reactor; this will get
-                                // relayed back to us. We send these events through
-                                // the reactor so that we can record/replay them.
-                                sequence.timed_out = true;
-                                events_tx.send(reactor::Event::RaiseTimeout { sequence_id: sequence.sequence_id });
-                            }
+            // Calculate next timeout timer if we have an active sequence.
+            let timeout = if let Some(sequence) = &raise_manager.active_sequence {
+                sequence_timeout(sequence)
+            } else {
+                Duration::MAX
+            };
+            timeout_timer.set_next_fire(timeout);
+
+            tokio::select! {
+                // Handle messages from reactor
+                Some((span, msg)) = rx.recv() => {
+                    let _guard = span.enter();
+                    raise_manager.handle_message(msg);
+                }
+
+                // Handle timeout - send timeout event to reactor
+                _ = timeout_timer.next() => {
+                    // Send timeout event for the active sequence
+                    if let Some(sequence) = &mut raise_manager.active_sequence {
+                        if sequence_timeout(sequence) <= Duration::ZERO {
+                            // Send timeout event to reactor; this will get
+                            // relayed back to us. We send these events through
+                            // the reactor so that we can record/replay them.
+                            sequence.timed_out = true;
+                            events_tx.send(reactor::Event::RaiseTimeout { sequence_id: sequence.sequence_id });
                         }
                     }
                 }
-            } else {
-                let Some((span, msg)) = rx.recv().await else {
-                    break;
-                };
-                let _guard = span.enter();
-                raise_manager.handle_message(msg);
             }
         }
     }
