@@ -132,14 +132,20 @@ impl VirtualWorkspace {
     pub fn window_count(&self) -> usize { self.windows.len() }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HideCorner {
     BottomLeft,
+    #[default]
     BottomRight,
 }
 
-impl Default for HideCorner {
-    fn default() -> Self { HideCorner::BottomRight }
+impl HideCorner {
+    pub fn opposite(self) -> Self {
+        match self {
+            HideCorner::BottomLeft => HideCorner::BottomRight,
+            HideCorner::BottomRight => HideCorner::BottomLeft,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -765,10 +771,8 @@ impl VirtualWorkspaceManager {
             .and_then(|ws| ws.windows().find(|wid| wid.idx.get() == idx))
     }
 
-    pub fn calculate_hidden_position(
-        &self,
+    fn hidden_rect_for_corner(
         screen_frame: CGRect,
-        _window_index: usize,
         original_size: CGSize,
         corner: HideCorner,
         app_bundle_id: Option<&str>,
@@ -799,7 +803,7 @@ impl VirtualWorkspaceManager {
             HideCorner::BottomRight => {
                 let bottom_right = CGPoint::new(screen_frame.max().x, screen_frame.max().y);
                 CGPoint::new(
-                    bottom_right.x - one_pixel_offset.x - 1.0, // -1 to keep 1px visible
+                    bottom_right.x - one_pixel_offset.x - 1.0,
                     bottom_right.y - one_pixel_offset.y,
                 )
             }
@@ -808,19 +812,109 @@ impl VirtualWorkspaceManager {
         CGRect::new(hidden_point, original_size)
     }
 
+    fn intersection_area(a: CGRect, b: CGRect) -> f64 {
+        let w: f64 = (a.max().x.min(b.max().x) - a.origin.x.max(b.origin.x)).max(0.0);
+        let h: f64 = (a.max().y.min(b.max().y) - a.origin.y.max(b.origin.y)).max(0.0);
+        w * h
+    }
+
+    fn choose_hidden_position(
+        &self,
+        screen_frame: CGRect,
+        original_size: CGSize,
+        corner: HideCorner,
+        app_bundle_id: Option<&str>,
+        other_screens: &[CGRect],
+    ) -> CGRect {
+        const MIN_ANCHOR_AREA: f64 = 1.0;
+        let primary = Self::hidden_rect_for_corner(screen_frame, original_size, corner, app_bundle_id);
+        let fallback =
+            Self::hidden_rect_for_corner(screen_frame, original_size, corner.opposite(), app_bundle_id);
+
+        let primary_anchor = Self::intersection_area(screen_frame, primary);
+        let fallback_anchor = Self::intersection_area(screen_frame, fallback);
+        let primary_anchored = primary_anchor >= MIN_ANCHOR_AREA;
+        let fallback_anchored = fallback_anchor >= MIN_ANCHOR_AREA;
+
+        let mut primary_other_max: f64 = 0.0;
+        let mut fallback_other_max: f64 = 0.0;
+        for screen in other_screens {
+            primary_other_max = primary_other_max.max(Self::intersection_area(*screen, primary));
+            fallback_other_max = fallback_other_max.max(Self::intersection_area(*screen, fallback));
+        }
+
+        match (primary_anchored, fallback_anchored) {
+            (true, false) => primary,
+            (false, true) => fallback,
+            (true, true) => {
+                if (primary_other_max - fallback_other_max).abs() > f64::EPSILON {
+                    if primary_other_max < fallback_other_max {
+                        primary
+                    } else {
+                        fallback
+                    }
+                } else if primary_anchor <= fallback_anchor {
+                    primary
+                } else {
+                    fallback
+                }
+            }
+            (false, false) => {
+                if primary_other_max <= fallback_other_max {
+                    primary
+                } else {
+                    fallback
+                }
+            }
+        }
+    }
+
+    pub fn calculate_hidden_position(
+        &self,
+        screen_frame: CGRect,
+        original_size: CGSize,
+        corner: HideCorner,
+        app_bundle_id: Option<&str>,
+    ) -> CGRect {
+        self.choose_hidden_position(screen_frame, original_size, corner, app_bundle_id, &[])
+    }
+
+    pub fn calculate_hidden_position_multi(
+        &self,
+        screen_frame: CGRect,
+        original_size: CGSize,
+        corner: HideCorner,
+        app_bundle_id: Option<&str>,
+        all_screens: &[CGRect],
+    ) -> CGRect {
+        let other_screens: Vec<CGRect> =
+            all_screens.iter().copied().filter(|screen| *screen != screen_frame).collect();
+        self.choose_hidden_position(
+            screen_frame,
+            original_size,
+            corner,
+            app_bundle_id,
+            &other_screens,
+        )
+    }
+
     pub fn is_hidden_position(
         &self,
         screen_frame: &CGRect,
         rect: &CGRect,
         app_bundle_id: Option<&str>,
     ) -> bool {
-        let hidden_rect = self.calculate_hidden_position(
+        const VISIBLE_THRESHOLD_PX: f64 = 3.0;
+        let hidden_rect = self.choose_hidden_position(
             *screen_frame,
-            0,
             rect.size,
             HideCorner::BottomRight,
             app_bundle_id,
+            &[],
         );
+        if rect.origin == hidden_rect.origin && rect.size == hidden_rect.size {
+            return true;
+        }
 
         let visible_width = (rect.max().x.min(screen_frame.max().x)
             - rect.origin.x.max(screen_frame.origin.x))
@@ -828,10 +922,37 @@ impl VirtualWorkspaceManager {
         let visible_height = (rect.max().y.min(screen_frame.max().y)
             - rect.origin.y.max(screen_frame.origin.y))
         .max(0.0);
+        visible_width <= VISIBLE_THRESHOLD_PX || visible_height <= VISIBLE_THRESHOLD_PX
+    }
 
-        (rect.origin == hidden_rect.origin && rect.size == hidden_rect.size)
-            || visible_width <= 3.0
-            || visible_height <= 3.0
+    pub fn is_hidden_position_multi(
+        &self,
+        screen_frame: &CGRect,
+        rect: &CGRect,
+        app_bundle_id: Option<&str>,
+        all_screens: &[CGRect],
+    ) -> bool {
+        const VISIBLE_THRESHOLD_PX: f64 = 3.0;
+        let other_screens: Vec<CGRect> =
+            all_screens.iter().copied().filter(|screen| *screen != *screen_frame).collect();
+        let hidden_rect = self.choose_hidden_position(
+            *screen_frame,
+            rect.size,
+            HideCorner::BottomRight,
+            app_bundle_id,
+            &other_screens,
+        );
+        if rect.origin == hidden_rect.origin && rect.size == hidden_rect.size {
+            return true;
+        }
+
+        let visible_width = (rect.max().x.min(screen_frame.max().x)
+            - rect.origin.x.max(screen_frame.origin.x))
+        .max(0.0);
+        let visible_height = (rect.max().y.min(screen_frame.max().y)
+            - rect.origin.y.max(screen_frame.origin.y))
+        .max(0.0);
+        visible_width <= VISIBLE_THRESHOLD_PX || visible_height <= VISIBLE_THRESHOLD_PX
     }
 
     pub fn set_last_focused_window(

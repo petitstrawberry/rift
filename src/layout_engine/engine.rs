@@ -1595,6 +1595,7 @@ impl LayoutEngine {
         stack_line_horiz: crate::common::config::HorizontalPlacement,
         stack_line_vert: crate::common::config::VerticalPlacement,
         get_window_frame: F,
+        all_screens: &[CGRect],
     ) -> Vec<(WindowId, CGRect)>
     where
         F: Fn(WindowId) -> Option<CGRect>,
@@ -1622,16 +1623,18 @@ impl LayoutEngine {
             candidate: Option<CGRect>,
             store_if_absent: bool,
             screen: &CGRect,
+            all_screens: &[CGRect],
             center_rect: &impl Fn(CGSize) -> CGRect,
             window_size: &impl Fn(WindowId) -> CGSize,
         ) {
             let existing = positions.get(&wid).copied();
             let bundle_id = engine.get_app_bundle_id_for_window(wid);
             let visible = candidate.or(existing).filter(|rect| {
-                !engine.virtual_workspace_manager.is_hidden_position(
+                !engine.virtual_workspace_manager.is_hidden_position_multi(
                     screen,
                     rect,
                     bundle_id.as_deref(),
+                    all_screens,
                 )
             });
             let rect = visible.unwrap_or_else(|| center_rect(window_size(wid)));
@@ -1683,6 +1686,7 @@ impl LayoutEngine {
                         Some(stored_position),
                         false,
                         &screen,
+                        all_screens,
                         &center_rect,
                         &window_size,
                     );
@@ -1700,6 +1704,7 @@ impl LayoutEngine {
                     None,
                     false,
                     &screen,
+                    all_screens,
                     &center_rect,
                     &window_size,
                 );
@@ -1707,7 +1712,7 @@ impl LayoutEngine {
         }
 
         let hidden_windows = self.virtual_workspace_manager.windows_in_inactive_workspaces(space);
-        for (index, wid) in hidden_windows.into_iter().enumerate() {
+        for wid in hidden_windows {
             let original_frame = get_window_frame(wid);
 
             if self.floating.is_floating(wid) {
@@ -1723,6 +1728,7 @@ impl LayoutEngine {
                         original_frame,
                         true,
                         &screen,
+                        all_screens,
                         &center_rect,
                         &window_size,
                     );
@@ -1732,12 +1738,12 @@ impl LayoutEngine {
             let original_size =
                 original_frame.map(|f| f.size).unwrap_or_else(|| CGSize::new(500.0, 500.0));
             let app_bundle_id = self.get_app_bundle_id_for_window(wid);
-            let hidden_rect = self.virtual_workspace_manager.calculate_hidden_position(
+            let hidden_rect = self.virtual_workspace_manager.calculate_hidden_position_multi(
                 screen,
-                index,
                 original_size,
                 HideCorner::BottomRight,
                 app_bundle_id.as_deref(),
+                all_screens,
             );
             positions.insert(wid, hidden_rect);
         }
