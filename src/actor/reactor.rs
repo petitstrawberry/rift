@@ -20,7 +20,6 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -33,7 +32,6 @@ use events::window::WindowEventHandler;
 use main_window::MainWindowTracker;
 use managers::LayoutManager;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use parking_lot::RwLock;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -222,6 +220,9 @@ pub enum Event {
         sequence_id: u64,
     },
 
+    #[serde(skip)]
+    Query(query::QueryRequest),
+
     Command(Command),
 
     #[serde(skip)]
@@ -269,26 +270,23 @@ impl Reactor {
     ) -> ReactorHandle {
         let (events_tx, events) = actor::channel();
         let events_tx_clone = events_tx.clone();
-        let reactor = Arc::new(RwLock::new(Reactor::new(
+        let mut reactor = Reactor::new(
             config,
             layout_engine,
             record,
             broadcast_tx,
             window_notify,
             one_space,
-        )));
-        {
-            let mut reactor = reactor.write();
-            reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
-            reactor.menu_manager.menu_tx = Some(menu_tx);
-            reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
-            reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
-        }
-        let query_handle = ReactorQueryHandle::new(reactor.clone());
+        );
+        reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
+        reactor.menu_manager.menu_tx = Some(menu_tx);
+        reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
+        reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
+        let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
         thread::Builder::new()
             .name("reactor".to_string())
             .spawn(move || {
-                Executor::run(Reactor::run_shared(reactor, events, events_tx_clone));
+                Executor::run(Reactor::run(reactor, events, events_tx_clone));
             })
             .unwrap();
         ReactorHandle::new(events_tx, query_handle)
@@ -744,45 +742,37 @@ impl Reactor {
         }
     }
 
-    pub async fn run_shared(reactor: Arc<RwLock<Reactor>>, events: Receiver, events_tx: Sender) {
+    async fn run(mut reactor: Reactor, events: Receiver, events_tx: Sender) {
         let (raise_manager_tx, raise_manager_rx) = actor::channel();
-        let event_tap_tx = {
-            let mut reactor = reactor.write();
-            reactor.communication_manager.raise_manager_tx = raise_manager_tx.clone();
-            reactor.communication_manager.event_tap_tx.clone()
-        };
-        let reactor_task = Self::run_reactor_loop_shared(reactor, events);
+        reactor.communication_manager.raise_manager_tx = raise_manager_tx.clone();
+        let event_tap_tx = reactor.communication_manager.event_tap_tx.clone();
+        let reactor_task = Self::run_reactor_loop(reactor, events);
         let raise_manager_task = RaiseManager::run(raise_manager_rx, events_tx, event_tap_tx);
         let _ = tokio::join!(reactor_task, raise_manager_task);
     }
 
-    async fn run_reactor_loop_shared(reactor: Arc<RwLock<Reactor>>, mut events: Receiver) {
+    async fn run_reactor_loop(mut reactor: Reactor, mut events: Receiver) {
+        const MAX_EVENT_BATCH: usize = 64;
+
         while let Some((span, event)) = events.recv().await {
             let _guard = span.enter();
-            let mut reactor = reactor.write();
             reactor.handle_loop_event(event);
-        }
-    }
-
-    pub async fn run(mut self, events: Receiver, events_tx: Sender) {
-        let (raise_manager_tx, raise_manager_rx) = actor::channel();
-        self.communication_manager.raise_manager_tx = raise_manager_tx.clone();
-
-        let event_tap_tx = self.communication_manager.event_tap_tx.clone();
-        let reactor_task = self.run_reactor_loop(events);
-        let raise_manager_task = RaiseManager::run(raise_manager_rx, events_tx, event_tap_tx);
-
-        let _ = tokio::join!(reactor_task, raise_manager_task);
-    }
-
-    async fn run_reactor_loop(mut self, mut events: Receiver) {
-        while let Some((span, event)) = events.recv().await {
-            let _guard = span.enter();
-            self.handle_loop_event(event);
+            // Drain a bounded batch to reduce recv/select overhead.
+            for _ in 1..MAX_EVENT_BATCH {
+                let Ok((span, event)) = events.try_recv() else {
+                    break;
+                };
+                let _guard = span.enter();
+                reactor.handle_loop_event(event);
+            }
         }
     }
 
     fn handle_loop_event(&mut self, event: Event) {
+        if let Event::Query(req) = event {
+            self.handle_query_request(req);
+            return;
+        }
         if self.maybe_quarantine_during_churn(&event) {
             Self::note_windowserver_activity(&event);
             trace!(?event, "quarantined event during display churn");

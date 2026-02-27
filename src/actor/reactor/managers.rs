@@ -244,6 +244,7 @@ impl LayoutManager {
             return LayoutResult::new();
         }
         let screens = reactor.space_manager.screens.clone();
+        let all_screen_frames: Vec<CGRect> = screens.iter().map(|s| s.frame).collect();
         let active_space_count = screens
             .iter()
             .filter_map(|screen| screen.space)
@@ -278,6 +279,7 @@ impl LayoutManager {
                     reactor.config.settings.ui.stack_line.horiz_placement,
                     reactor.config.settings.ui.stack_line.vert_placement,
                     |wid| reactor.window_manager.windows.get(&wid).map(|w| w.frame_monotonic),
+                    &all_screen_frames,
                 );
             if active_space_count > 1
                 && reactor.layout_manager.layout_engine.active_layout_mode_at(space)

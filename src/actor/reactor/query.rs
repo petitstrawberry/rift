@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
+use std::sync::mpsc::{RecvError, SyncSender, sync_channel};
 use objc2_core_foundation::CGRect;
-use parking_lot::RwLock;
 
 use crate::actor::app::WindowId;
 use crate::actor::menu_bar;
-use crate::actor::reactor::Reactor;
+use crate::actor::reactor::{Event, Reactor, Sender};
 use crate::common::collections::HashSet;
 use crate::model::server::{
     ApplicationData, DisplayData, LayoutStateData, WindowData, WorkspaceData, WorkspaceLayoutData,
@@ -15,30 +13,41 @@ use crate::sys::screen::{ScreenInfo, SpaceId, get_active_space_number, managed_d
 
 #[derive(Clone)]
 pub struct ReactorQueryHandle {
-    inner: Arc<RwLock<Reactor>>,
+    tx: Sender,
 }
 
 impl ReactorQueryHandle {
-    pub fn new(inner: Arc<RwLock<Reactor>>) -> Self { Self { inner } }
+    pub(super) fn new(tx: Sender) -> Self { Self { tx } }
+
+    fn send_query<T>(
+        &self,
+        build: impl FnOnce(SyncSender<T>) -> QueryRequest,
+    ) -> Result<T, RecvError> {
+        let (tx, rx) = sync_channel(1);
+        if self.tx.try_send(Event::Query(build(tx))).is_err() {
+            return Err(RecvError);
+        }
+        rx.recv().map_err(|_| RecvError)
+    }
 
     pub fn query_workspaces(&self, space_id: Option<SpaceId>) -> Vec<WorkspaceData> {
-        let mut reactor = self.inner.write();
-        reactor.query_workspaces(space_id)
+        self.send_query(|resp| QueryRequest::Workspaces { space_id, resp })
+            .unwrap_or_default()
     }
 
     pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {
-        let mut reactor = self.inner.write();
-        reactor.query_windows(space_id)
+        self.send_query(|resp| QueryRequest::Windows { space_id, resp })
+            .unwrap_or_default()
     }
 
     pub fn query_active_workspace(&self, space_id: Option<SpaceId>) -> Option<VirtualWorkspaceId> {
-        let mut reactor = self.inner.write();
-        reactor.query_active_workspace(space_id)
+        self.send_query(|resp| QueryRequest::ActiveWorkspace { space_id, resp })
+            .ok()
+            .flatten()
     }
 
     pub fn query_displays(&self) -> Vec<DisplayData> {
-        let mut reactor = self.inner.write();
-        reactor.query_displays()
+        self.send_query(QueryRequest::Displays).unwrap_or_default()
     }
 
     pub fn query_workspace_layouts(
@@ -46,32 +55,105 @@ impl ReactorQueryHandle {
         space_id: Option<SpaceId>,
         workspace_id: Option<usize>,
     ) -> Vec<WorkspaceLayoutData> {
-        let mut reactor = self.inner.write();
-        reactor.query_workspace_layouts(space_id, workspace_id)
+        self.send_query(|resp| QueryRequest::WorkspaceLayouts {
+            space_id,
+            workspace_id,
+            resp,
+        })
+        .unwrap_or_default()
     }
 
     pub fn query_window_info(&self, window_id: WindowId) -> Option<WindowData> {
-        let mut reactor = self.inner.write();
-        reactor.query_window_info(window_id)
+        self.send_query(|resp| QueryRequest::WindowInfo { window_id, resp })
+            .ok()
+            .flatten()
     }
 
     pub fn query_applications(&self) -> Vec<ApplicationData> {
-        let mut reactor = self.inner.write();
-        reactor.query_applications()
+        self.send_query(QueryRequest::Applications).unwrap_or_default()
     }
 
     pub fn query_layout_state(&self, space_id: u64) -> Option<LayoutStateData> {
-        let mut reactor = self.inner.write();
-        reactor.query_layout_state(space_id)
+        self.send_query(|resp| QueryRequest::LayoutState { space_id, resp })
+            .ok()
+            .flatten()
     }
 
     pub fn query_metrics(&self) -> serde_json::Value {
-        let mut reactor = self.inner.write();
-        reactor.query_metrics()
+        self.send_query(QueryRequest::Metrics)
+            .unwrap_or_else(|_| serde_json::json!({}))
     }
 }
 
+#[derive(Debug)]
+pub enum QueryRequest {
+    Workspaces {
+        space_id: Option<SpaceId>,
+        resp: SyncSender<Vec<WorkspaceData>>,
+    },
+    Windows {
+        space_id: Option<SpaceId>,
+        resp: SyncSender<Vec<WindowData>>,
+    },
+    ActiveWorkspace {
+        space_id: Option<SpaceId>,
+        resp: SyncSender<Option<VirtualWorkspaceId>>,
+    },
+    Displays(SyncSender<Vec<DisplayData>>),
+    WorkspaceLayouts {
+        space_id: Option<SpaceId>,
+        workspace_id: Option<usize>,
+        resp: SyncSender<Vec<WorkspaceLayoutData>>,
+    },
+    WindowInfo {
+        window_id: WindowId,
+        resp: SyncSender<Option<WindowData>>,
+    },
+    Applications(SyncSender<Vec<ApplicationData>>),
+    LayoutState {
+        space_id: u64,
+        resp: SyncSender<Option<LayoutStateData>>,
+    },
+    Metrics(SyncSender<serde_json::Value>),
+}
+
 impl Reactor {
+    pub(super) fn handle_query_request(&mut self, req: QueryRequest) {
+        match req {
+            QueryRequest::Workspaces { space_id, resp } => {
+                let _ = resp.send(self.query_workspaces(space_id));
+            }
+            QueryRequest::Windows { space_id, resp } => {
+                let _ = resp.send(self.query_windows(space_id));
+            }
+            QueryRequest::ActiveWorkspace { space_id, resp } => {
+                let _ = resp.send(self.query_active_workspace(space_id));
+            }
+            QueryRequest::Displays(resp) => {
+                let _ = resp.send(self.query_displays());
+            }
+            QueryRequest::WorkspaceLayouts {
+                space_id,
+                workspace_id,
+                resp,
+            } => {
+                let _ = resp.send(self.query_workspace_layouts(space_id, workspace_id));
+            }
+            QueryRequest::WindowInfo { window_id, resp } => {
+                let _ = resp.send(self.query_window_info(window_id));
+            }
+            QueryRequest::Applications(resp) => {
+                let _ = resp.send(self.query_applications());
+            }
+            QueryRequest::LayoutState { space_id, resp } => {
+                let _ = resp.send(self.query_layout_state(space_id));
+            }
+            QueryRequest::Metrics(resp) => {
+                let _ = resp.send(self.query_metrics());
+            }
+        }
+    }
+
     fn default_query_space(&self) -> Option<SpaceId> {
         self.workspace_command_space()
             .or_else(|| get_active_space_number())
@@ -82,18 +164,18 @@ impl Reactor {
         self.handle_workspace_query(space_id)
     }
 
-    pub fn query_windows(&mut self, space_id: Option<SpaceId>) -> Vec<WindowData> {
+    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<WindowData> {
         self.handle_windows_query(space_id)
     }
 
     pub fn query_active_workspace(
-        &mut self,
+        &self,
         space_id: Option<SpaceId>,
     ) -> Option<VirtualWorkspaceId> {
         self.handle_active_workspace_query(space_id)
     }
 
-    pub fn query_displays(&mut self) -> Vec<DisplayData> { self.handle_displays_query() }
+    pub fn query_displays(&self) -> Vec<DisplayData> { self.handle_displays_query() }
 
     pub fn query_workspace_layouts(
         &mut self,
@@ -103,19 +185,19 @@ impl Reactor {
         self.handle_workspace_layouts_query(space_id, workspace_id)
     }
 
-    pub fn query_window_info(&mut self, window_id: WindowId) -> Option<WindowData> {
+    pub fn query_window_info(&self, window_id: WindowId) -> Option<WindowData> {
         self.handle_window_info_query(window_id)
     }
 
-    pub fn query_applications(&mut self) -> Vec<ApplicationData> {
+    pub fn query_applications(&self) -> Vec<ApplicationData> {
         self.handle_applications_query()
     }
 
-    pub fn query_layout_state(&mut self, space_id: u64) -> Option<LayoutStateData> {
+    pub fn query_layout_state(&self, space_id: u64) -> Option<LayoutStateData> {
         self.handle_layout_state_query(space_id)
     }
 
-    pub fn query_metrics(&mut self) -> serde_json::Value { self.handle_metrics_query() }
+    pub fn query_metrics(&self) -> serde_json::Value { self.handle_metrics_query() }
 
     pub(super) fn maybe_send_menu_update(&mut self) {
         let menu_tx = match self.menu_manager.menu_tx.as_ref() {
