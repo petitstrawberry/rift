@@ -1,4 +1,5 @@
 use std::sync::mpsc::{RecvError, SyncSender, sync_channel};
+
 use objc2_core_foundation::CGRect;
 
 use crate::actor::app::WindowId;
@@ -55,12 +56,8 @@ impl ReactorQueryHandle {
         space_id: Option<SpaceId>,
         workspace_id: Option<usize>,
     ) -> Vec<WorkspaceLayoutData> {
-        self.send_query(|resp| QueryRequest::WorkspaceLayouts {
-            space_id,
-            workspace_id,
-            resp,
-        })
-        .unwrap_or_default()
+        self.send_query(|resp| QueryRequest::WorkspaceLayouts { space_id, workspace_id, resp })
+            .unwrap_or_default()
     }
 
     pub fn query_window_info(&self, window_id: WindowId) -> Option<WindowData> {
@@ -80,8 +77,7 @@ impl ReactorQueryHandle {
     }
 
     pub fn query_metrics(&self) -> serde_json::Value {
-        self.send_query(QueryRequest::Metrics)
-            .unwrap_or_else(|_| serde_json::json!({}))
+        self.send_query(QueryRequest::Metrics).unwrap_or_else(|_| serde_json::json!({}))
     }
 }
 
@@ -132,11 +128,7 @@ impl Reactor {
             QueryRequest::Displays(resp) => {
                 let _ = resp.send(self.query_displays());
             }
-            QueryRequest::WorkspaceLayouts {
-                space_id,
-                workspace_id,
-                resp,
-            } => {
+            QueryRequest::WorkspaceLayouts { space_id, workspace_id, resp } => {
                 let _ = resp.send(self.query_workspace_layouts(space_id, workspace_id));
             }
             QueryRequest::WindowInfo { window_id, resp } => {
@@ -168,10 +160,7 @@ impl Reactor {
         self.handle_windows_query(space_id)
     }
 
-    pub fn query_active_workspace(
-        &self,
-        space_id: Option<SpaceId>,
-    ) -> Option<VirtualWorkspaceId> {
+    pub fn query_active_workspace(&self, space_id: Option<SpaceId>) -> Option<VirtualWorkspaceId> {
         self.handle_active_workspace_query(space_id)
     }
 
@@ -189,9 +178,7 @@ impl Reactor {
         self.handle_window_info_query(window_id)
     }
 
-    pub fn query_applications(&self) -> Vec<ApplicationData> {
-        self.handle_applications_query()
-    }
+    pub fn query_applications(&self) -> Vec<ApplicationData> { self.handle_applications_query() }
 
     pub fn query_layout_state(&self, space_id: u64) -> Option<LayoutStateData> {
         self.handle_layout_state_query(space_id)
@@ -211,6 +198,7 @@ impl Reactor {
         };
 
         let workspaces = self.handle_workspace_query(Some(active_space));
+        let active_space_is_activated = self.is_space_active(active_space);
         let active_workspace = self.layout_manager.layout_engine.active_workspace(active_space);
         let active_workspace_idx =
             self.layout_manager.layout_engine.active_workspace_idx(active_space);
@@ -218,6 +206,7 @@ impl Reactor {
 
         menu_tx.send(menu_bar::Event::Update(menu_bar::Update {
             active_space,
+            active_space_is_activated,
             workspaces,
             active_workspace_idx,
             active_workspace,

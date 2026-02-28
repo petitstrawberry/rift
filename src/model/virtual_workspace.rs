@@ -827,9 +827,14 @@ impl VirtualWorkspaceManager {
         other_screens: &[CGRect],
     ) -> CGRect {
         const MIN_ANCHOR_AREA: f64 = 1.0;
-        let primary = Self::hidden_rect_for_corner(screen_frame, original_size, corner, app_bundle_id);
-        let fallback =
-            Self::hidden_rect_for_corner(screen_frame, original_size, corner.opposite(), app_bundle_id);
+        let primary =
+            Self::hidden_rect_for_corner(screen_frame, original_size, corner, app_bundle_id);
+        let fallback = Self::hidden_rect_for_corner(
+            screen_frame,
+            original_size,
+            corner.opposite(),
+            app_bundle_id,
+        );
 
         let primary_anchor = Self::intersection_area(screen_frame, primary);
         let fallback_anchor = Self::intersection_area(screen_frame, fallback);

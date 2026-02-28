@@ -194,11 +194,12 @@ impl SpaceEventHandler {
             .iter()
             .filter_map(|screen| screen.space.map(|space| (screen.display_uuid.clone(), space)))
             .collect();
-        let display_space_changed = previous_spaces_by_display.iter().any(|(display_uuid, space)| {
-            new_spaces_by_display
-                .get(display_uuid)
-                .is_some_and(|new_space| new_space != space)
-        });
+        let display_space_changed =
+            previous_spaces_by_display.iter().any(|(display_uuid, space)| {
+                new_spaces_by_display
+                    .get(display_uuid)
+                    .is_some_and(|new_space| new_space != space)
+            });
 
         // IMPORTANT:
         // Only treat display topology changes as such once we have a prior known set.

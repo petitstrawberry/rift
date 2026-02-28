@@ -579,6 +579,22 @@ impl EventTap {
         }
     }
 
+    fn refresh_disable_hotkey_state(&self, state: &mut State) {
+        let Some(target) = self.disable_hotkey.borrow().as_ref().cloned() else {
+            return;
+        };
+        let prev_active = state.disable_hotkey_active;
+        state.disable_hotkey_active = state.compute_disable_hotkey_active(&target);
+        if state.disable_hotkey_active != prev_active {
+            if state.disable_hotkey_active {
+                debug!(?target, "focus_follows_mouse disabled while hotkey held");
+            } else {
+                debug!(?target, "focus_follows_mouse re-enabled after hotkey release");
+                state.reset(true);
+            }
+        }
+    }
+
     fn on_event(self: &Rc<Self>, event_type: CGEventType, event: &CGEvent) -> bool {
         if event_type.0 == NSEventType::Gesture.0 as u32 {
             let scroll_handler = self.scroll.borrow();
@@ -604,6 +620,19 @@ impl EventTap {
         }
 
         let mut state = self.state.borrow_mut();
+
+        if !matches!(
+            event_type,
+            CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+        ) {
+            // Keep modifier-only hotkey state in sync even when macOS drops a
+            // key-up/flags-changed event (common after system UI interruptions).
+            let flags = CGEvent::flags(Some(event));
+            if flags != state.current_flags {
+                state.current_flags = flags;
+                self.refresh_disable_hotkey_state(&mut state);
+            }
+        }
 
         match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
@@ -957,19 +986,7 @@ impl EventTap {
 
         let flags = CGEvent::flags(Some(event));
         state.current_flags = flags;
-
-        if let Some(target) = self.disable_hotkey.borrow().as_ref() {
-            let prev_active = state.disable_hotkey_active;
-            state.disable_hotkey_active = state.compute_disable_hotkey_active(target);
-            if state.disable_hotkey_active != prev_active {
-                if state.disable_hotkey_active {
-                    debug!(?target, "focus_follows_mouse disabled while hotkey held");
-                } else {
-                    debug!(?target, "focus_follows_mouse re-enabled after hotkey release");
-                    state.reset(true);
-                }
-            }
-        }
+        self.refresh_disable_hotkey_state(state);
 
         if event_type == CGEventType::KeyDown {
             if let Some(key_code) = key_code_opt {
