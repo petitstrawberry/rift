@@ -906,6 +906,8 @@ impl LayoutSystem for BspLayoutSystem {
                 if !self.belongs_to_layout(state, node) {
                     return;
                 }
+                let tiling = Self::apply_outer_gaps(screen, gaps);
+                let mut fullscreen_transition = false;
                 if let Some(NodeKind::Leaf {
                     window: _,
                     fullscreen,
@@ -916,20 +918,92 @@ impl LayoutSystem for BspLayoutSystem {
                     if new_frame == screen {
                         *fullscreen = true;
                         *fullscreen_within_gaps = false;
+                        fullscreen_transition = true;
                     } else if old_frame == screen {
                         *fullscreen = false;
+                        fullscreen_transition = true;
                     } else {
-                        let tiling = Self::apply_outer_gaps(screen, gaps);
                         if new_frame == tiling {
                             *fullscreen_within_gaps = true;
                             *fullscreen = false;
+                            fullscreen_transition = true;
                         } else if old_frame == tiling {
                             *fullscreen_within_gaps = false;
+                            fullscreen_transition = true;
                         }
                     }
                 }
+
+                if fullscreen_transition {
+                    return;
+                }
+
+                let width_changed = (new_frame.size.width - old_frame.size.width).abs() > 0.5;
+                let height_changed = (new_frame.size.height - old_frame.size.height).abs() > 0.5;
+                if !width_changed && !height_changed {
+                    return;
+                }
+
+                let mut current = node;
+                while let Some(parent) = current.parent(&self.tree.map) {
+                    let Some(NodeKind::Split { orientation, ratio }) = self.kind.get_mut(parent)
+                    else {
+                        current = parent;
+                        continue;
+                    };
+
+                    let (old_len, new_len) = match orientation {
+                        Orientation::Horizontal if width_changed => {
+                            (old_frame.size.width, new_frame.size.width)
+                        }
+                        Orientation::Vertical if height_changed => {
+                            (old_frame.size.height, new_frame.size.height)
+                        }
+                        _ => {
+                            current = parent;
+                            continue;
+                        }
+                    };
+
+                    let current_ratio = f64::from(*ratio);
+                    let is_first = Some(current) == parent.first_child(&self.tree.map);
+                    let denom = if is_first {
+                        current_ratio
+                    } else {
+                        1.0 - current_ratio
+                    };
+                    if old_len <= 0.0 || denom <= f64::EPSILON {
+                        break;
+                    }
+
+                    let parent_len = old_len / denom;
+                    if parent_len <= 0.0 {
+                        break;
+                    }
+
+                    let raw_ratio = (new_len / parent_len).clamp(0.05, 0.95);
+                    *ratio = if is_first {
+                        raw_ratio as f32
+                    } else {
+                        (1.0 - raw_ratio) as f32
+                    };
+                    break;
+                }
             }
         }
+    }
+
+    fn apply_window_size_constraint(
+        &mut self,
+        layout: LayoutId,
+        wid: WindowId,
+        current_frame: CGRect,
+        target_size: objc2_core_foundation::CGSize,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
+    ) {
+        let target_frame = CGRect::new(current_frame.origin, target_size);
+        self.on_window_resized(layout, wid, current_frame, target_frame, screen, gaps);
     }
 
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool {

@@ -402,6 +402,8 @@ impl WindowDiscoveryHandler {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                bool,
+                objc2_core_foundation::CGSize,
             )> = windows_for_space
                 .iter()
                 .filter_map(|&wid| {
@@ -414,6 +416,8 @@ impl WindowDiscoveryHandler {
                         Some(window.info.title.clone()),
                         window.info.ax_role.clone(),
                         window.info.ax_subrole.clone(),
+                        window.info.is_resizable,
+                        window.frame_monotonic.size,
                     ))
                 })
                 .collect();

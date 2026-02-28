@@ -1959,19 +1959,19 @@ impl Reactor {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                bool,
+                CGSize,
             )> = manageable_windows
                 .iter()
                 .map(|&wid| {
-                    let title_opt =
-                        self.window_manager.windows.get(&wid).map(|w| w.info.title.clone());
-                    let ax_role =
-                        self.window_manager.windows.get(&wid).and_then(|w| w.info.ax_role.clone());
-                    let ax_subrole = self
-                        .window_manager
-                        .windows
-                        .get(&wid)
-                        .and_then(|w| w.info.ax_subrole.clone());
-                    (wid, title_opt, ax_role, ax_subrole)
+                    let window = self.window_manager.windows.get(&wid);
+                    let title_opt = window.map(|w| w.info.title.clone());
+                    let ax_role = window.and_then(|w| w.info.ax_role.clone());
+                    let ax_subrole = window.and_then(|w| w.info.ax_subrole.clone());
+                    let is_resizable = window.map_or(true, |w| w.info.is_resizable);
+                    let size_hint =
+                        window.map_or(CGSize::new(0.0, 0.0), |w| w.frame_monotonic.size);
+                    (wid, title_opt, ax_role, ax_subrole, is_resizable, size_hint)
                 })
                 .collect();
 
@@ -2577,7 +2577,7 @@ impl Reactor {
             LayoutEvent::WindowsOnScreenUpdated(space, _, windows, _) => {
                 let hidden_exists = windows
                     .iter()
-                    .any(|(wid, _, _, _)| self.window_in_non_active_workspace(*space, *wid));
+                    .any(|(wid, _, _, _, _, _)| self.window_in_non_active_workspace(*space, *wid));
                 if hidden_exists {
                     self.refocus_manager.refocus_state = RefocusState::Pending(*space);
                 }

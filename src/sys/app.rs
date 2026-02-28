@@ -394,6 +394,8 @@ pub struct WindowInfo {
     pub is_root: bool,
     #[serde(default)]
     pub is_minimized: bool,
+    #[serde(default)]
+    pub is_resizable: bool,
     pub title: String,
     #[serde(with = "CGRectDef")]
     pub frame: CGRect,
@@ -422,6 +424,7 @@ impl WindowInfo {
             .map(|info| info.id)
             .or_else(|| WindowServerId::try_from(element).ok());
         let is_minimized = element.minimized().unwrap_or_default();
+        let is_resizable = element.can_resize().unwrap_or(true);
 
         let (bundle_id, path) = if !is_standard {
             (None, None)
@@ -438,6 +441,7 @@ impl WindowInfo {
             is_standard,
             is_root: true,
             is_minimized,
+            is_resizable,
             title: element.title().unwrap_or_default(),
             frame,
             sys_id: id,
