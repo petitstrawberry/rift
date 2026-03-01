@@ -289,7 +289,8 @@ impl State {
     fn txid_from_store(&self, wsid: Option<WindowServerId>) -> Option<TransactionId> {
         let store = self.tx_store.as_ref()?;
         let wsid = wsid?;
-        store.get(&wsid).map(|record| record.txid)
+        let record = store.get(&wsid)?;
+        record.target.map(|_| record.txid)
     }
 
     fn txid_for_window_state(&self, window: &AppWindowState) -> Option<TransactionId> {

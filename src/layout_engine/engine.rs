@@ -96,7 +96,14 @@ pub enum LayoutEvent {
     WindowsOnScreenUpdated(
         SpaceId,
         pid_t,
-        Vec<(WindowId, Option<String>, Option<String>, Option<String>)>,
+        Vec<(
+            WindowId,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            CGSize,
+        )>,
         Option<AppInfo>,
     ),
     AppClosed(pid_t),
@@ -136,6 +143,10 @@ pub struct LayoutEngine {
     space_display_map: HashMap<SpaceId, Option<String>>,
     #[serde(skip)]
     display_last_space: HashMap<String, SpaceId>,
+    #[serde(skip)]
+    locked_resize_windows: HashSet<WindowId>,
+    #[serde(skip)]
+    locked_resize_target_sizes: HashMap<WindowId, CGSize>,
 }
 
 impl LayoutEngine {
@@ -792,6 +803,8 @@ impl LayoutEngine {
 
     fn remove_window_internal(&mut self, wid: WindowId, preserve_floating: bool) {
         let affected_space: Option<SpaceId> = self.space_with_window(wid);
+        self.locked_resize_windows.remove(&wid);
+        self.locked_resize_target_sizes.remove(&wid);
 
         let ws_ids = self.virtual_workspace_manager.workspaces_for_window(wid);
         if !ws_ids.is_empty() {
@@ -944,7 +957,88 @@ impl LayoutEngine {
             broadcast_tx,
             space_display_map: HashMap::default(),
             display_last_space: HashMap::default(),
+            locked_resize_windows: HashSet::default(),
+            locked_resize_target_sizes: HashMap::default(),
         }
+    }
+
+    #[inline]
+    fn is_window_resize_locked(&self, wid: WindowId) -> bool {
+        self.locked_resize_windows.contains(&wid)
+    }
+
+    fn calibrate_locked_tiled_positions(
+        &mut self,
+        workspace_id: crate::model::VirtualWorkspaceId,
+        layout: LayoutId,
+        mut tiled_positions: Vec<(WindowId, CGRect)>,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
+        stack_line_thickness: f64,
+        stack_line_horiz: crate::common::config::HorizontalPlacement,
+        stack_line_vert: crate::common::config::VerticalPlacement,
+    ) -> Vec<(WindowId, CGRect)> {
+        const SIZE_EPSILON: f64 = 0.5;
+
+        let constrained_targets: HashMap<WindowId, CGSize> = tiled_positions
+            .iter()
+            .filter_map(|(wid, _)| {
+                self.locked_resize_target_sizes
+                    .get(wid)
+                    .copied()
+                    .map(|target_size| (*wid, target_size))
+            })
+            .collect();
+
+        if constrained_targets.is_empty() {
+            return tiled_positions;
+        }
+
+        let max_passes = constrained_targets.len();
+        for _ in 0..max_passes {
+            let frames_by_window: HashMap<WindowId, CGRect> =
+                tiled_positions.iter().map(|(wid, frame)| (*wid, *frame)).collect();
+
+            let mut adjusted = false;
+
+            for (&wid, &target_size) in constrained_targets.iter() {
+                let Some(old_frame) = frames_by_window.get(&wid).copied() else {
+                    continue;
+                };
+
+                let width_diff = (old_frame.size.width - target_size.width).abs();
+                let height_diff = (old_frame.size.height - target_size.height).abs();
+                if width_diff <= SIZE_EPSILON && height_diff <= SIZE_EPSILON {
+                    continue;
+                }
+
+                self.workspace_tree_mut(workspace_id).apply_window_size_constraint(
+                    layout,
+                    wid,
+                    old_frame,
+                    target_size,
+                    screen,
+                    gaps,
+                );
+                adjusted = true;
+            }
+
+            if !adjusted {
+                break;
+            }
+
+            tiled_positions = self.workspace_tree(workspace_id).calculate_layout(
+                layout,
+                screen,
+                self.layout_settings.stack.stack_offset,
+                gaps,
+                stack_line_thickness,
+                stack_line_horiz,
+                stack_line_vert,
+            );
+        }
+
+        tiled_positions
     }
 
     pub fn debug_tree(&self, space: SpaceId) { self.debug_tree_desc(space, "", false); }
@@ -998,10 +1092,22 @@ impl LayoutEngine {
                     None => (None, None),
                 };
 
-                for (wid, title_opt, ax_role_opt, ax_subrole_opt) in windows_with_titles {
+                for (wid, title_opt, ax_role_opt, ax_subrole_opt, is_resizable, size_hint) in
+                    windows_with_titles
+                {
                     let title_ref = title_opt.as_deref();
                     let ax_role_ref = ax_role_opt.as_deref();
                     let ax_subrole_ref = ax_subrole_opt.as_deref();
+
+                    if is_resizable {
+                        self.locked_resize_windows.remove(&wid);
+                        self.locked_resize_target_sizes.remove(&wid);
+                    } else {
+                        self.locked_resize_windows.insert(wid);
+                        if size_hint.width > 0.0 && size_hint.height > 0.0 {
+                            self.locked_resize_target_sizes.insert(wid, size_hint);
+                        }
+                    }
 
                     let was_floating = self.floating.is_floating(wid);
                     let assignment = match self
@@ -1099,6 +1205,8 @@ impl LayoutEngine {
                     ws.layout_system.remove_windows_for_app(pid);
                 }
                 self.floating.remove_all_for_pid(pid);
+                self.locked_resize_windows.retain(|wid| wid.pid != pid);
+                self.locked_resize_target_sizes.retain(|wid, _| wid.pid != pid);
 
                 self.virtual_workspace_manager.remove_windows_for_app(pid);
                 self.virtual_workspace_manager.remove_app_floating_positions(pid);
@@ -1169,6 +1277,11 @@ impl LayoutEngine {
                 new_frame,
                 screens,
             } => {
+                if self.is_window_resize_locked(wid) {
+                    self.locked_resize_target_sizes.insert(wid, new_frame.size);
+                    return EventResponse::default();
+                }
+
                 for (space, screen_frame, display_uuid) in screens {
                     let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
                         debug!(
@@ -1489,6 +1602,14 @@ impl LayoutEngine {
                     return EventResponse::default();
                 }
 
+                if self
+                    .workspace_tree(workspace_id)
+                    .selected_window(layout)
+                    .is_some_and(|wid| self.is_window_resize_locked(wid))
+                {
+                    return EventResponse::default();
+                }
+
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 let resize_amount = 0.05;
                 self.workspace_tree_mut(workspace_id).resize_selection_by(layout, resize_amount);
@@ -1499,6 +1620,14 @@ impl LayoutEngine {
                     return EventResponse::default();
                 }
 
+                if self
+                    .workspace_tree(workspace_id)
+                    .selected_window(layout)
+                    .is_some_and(|wid| self.is_window_resize_locked(wid))
+                {
+                    return EventResponse::default();
+                }
+
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 let resize_amount = -0.05;
                 self.workspace_tree_mut(workspace_id).resize_selection_by(layout, resize_amount);
@@ -1506,6 +1635,14 @@ impl LayoutEngine {
             }
             LayoutCommand::ResizeWindowBy { amount } => {
                 if is_floating {
+                    return EventResponse::default();
+                }
+
+                if self
+                    .workspace_tree(workspace_id)
+                    .selected_window(layout)
+                    .is_some_and(|wid| self.is_window_resize_locked(wid))
+                {
                     return EventResponse::default();
                 }
 
@@ -1658,15 +1795,25 @@ impl LayoutEngine {
 
         if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(space) {
             if let Some(layout) = self.workspace_layouts.active(space, active_workspace_id) {
-                let tiled_positions = self.workspace_tree(active_workspace_id).calculate_layout(
+                let tiled_positions = self.calibrate_locked_tiled_positions(
+                    active_workspace_id,
                     layout,
+                    self.workspace_tree(active_workspace_id).calculate_layout(
+                        layout,
+                        screen,
+                        self.layout_settings.stack.stack_offset,
+                        gaps,
+                        stack_line_thickness,
+                        stack_line_horiz,
+                        stack_line_vert,
+                    ),
                     screen,
-                    self.layout_settings.stack.stack_offset,
                     gaps,
                     stack_line_thickness,
                     stack_line_horiz,
                     stack_line_vert,
                 );
+
                 for (wid, rect) in tiled_positions {
                     positions.insert(wid, rect);
                 }
@@ -1746,6 +1893,18 @@ impl LayoutEngine {
                 all_screens,
             );
             positions.insert(wid, hidden_rect);
+        }
+
+        for (wid, rect) in positions.iter_mut() {
+            if !self.is_window_resize_locked(*wid) {
+                continue;
+            }
+
+            let target_size = self.locked_resize_target_sizes.get(wid).copied();
+
+            if let Some(size) = target_size {
+                rect.size = size;
+            }
         }
 
         positions.into_iter().collect()
