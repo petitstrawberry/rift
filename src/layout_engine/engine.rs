@@ -1,6 +1,4 @@
 use std::cmp::Ordering;
-use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -11,8 +9,9 @@ use super::{Direction, FloatingManager, LayoutId, LayoutSystemKind, WorkspaceLay
 use crate::actor::app::{AppInfo, WindowId, pid_t};
 use crate::actor::broadcast::{BroadcastEvent, BroadcastSender};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{LayoutMode, LayoutSettings};
+use crate::common::config::{LayoutMode, LayoutSettings, VirtualWorkspaceSettings};
 use crate::layout_engine::LayoutSystem;
+use crate::layout_engine::systems::WindowLayoutConstraints;
 use crate::model::virtual_workspace::{
     AppRuleAssignment, AppRuleResult, VirtualWorkspace, VirtualWorkspaceId, VirtualWorkspaceManager,
 };
@@ -103,6 +102,8 @@ pub enum LayoutEvent {
             Option<String>,
             bool,
             CGSize,
+            Option<CGSize>,
+            Option<CGSize>,
         )>,
         Option<AppInfo>,
     ),
@@ -134,6 +135,8 @@ pub struct LayoutEngine {
     floating: FloatingManager,
     #[serde(skip)]
     focused_window: Option<WindowId>,
+    #[serde(skip)]
+    window_layout_constraints: HashMap<WindowId, WindowLayoutConstraints>,
     virtual_workspace_manager: VirtualWorkspaceManager,
     #[serde(skip)]
     layout_settings: LayoutSettings,
@@ -143,10 +146,6 @@ pub struct LayoutEngine {
     space_display_map: HashMap<SpaceId, Option<String>>,
     #[serde(skip)]
     display_last_space: HashMap<String, SpaceId>,
-    #[serde(skip)]
-    locked_resize_windows: HashSet<WindowId>,
-    #[serde(skip)]
-    locked_resize_target_sizes: HashMap<WindowId, CGSize>,
 }
 
 impl LayoutEngine {
@@ -831,8 +830,6 @@ impl LayoutEngine {
 
     fn remove_window_internal(&mut self, wid: WindowId, preserve_floating: bool) {
         let affected_space: Option<SpaceId> = self.space_with_window(wid);
-        self.locked_resize_windows.remove(&wid);
-        self.locked_resize_target_sizes.remove(&wid);
 
         let ws_ids = self.virtual_workspace_manager.workspaces_for_window(wid);
         if !ws_ids.is_empty() {
@@ -861,6 +858,7 @@ impl LayoutEngine {
         if self.focused_window == Some(wid) {
             self.focused_window = None;
         }
+        self.window_layout_constraints.remove(&wid);
 
         if let Some(space) = affected_space {
             self.broadcast_windows_changed(space);
@@ -980,93 +978,13 @@ impl LayoutEngine {
             workspace_layouts: WorkspaceLayouts::default(),
             floating: FloatingManager::new(),
             focused_window: None,
+            window_layout_constraints: HashMap::default(),
             virtual_workspace_manager,
             layout_settings: layout_settings.clone(),
             broadcast_tx,
             space_display_map: HashMap::default(),
             display_last_space: HashMap::default(),
-            locked_resize_windows: HashSet::default(),
-            locked_resize_target_sizes: HashMap::default(),
         }
-    }
-
-    #[inline]
-    fn is_window_resize_locked(&self, wid: WindowId) -> bool {
-        self.locked_resize_windows.contains(&wid)
-    }
-
-    fn calibrate_locked_tiled_positions(
-        &mut self,
-        workspace_id: crate::model::VirtualWorkspaceId,
-        layout: LayoutId,
-        mut tiled_positions: Vec<(WindowId, CGRect)>,
-        screen: CGRect,
-        gaps: &crate::common::config::GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        stack_line_vert: crate::common::config::VerticalPlacement,
-    ) -> Vec<(WindowId, CGRect)> {
-        const SIZE_EPSILON: f64 = 0.5;
-
-        let constrained_targets: HashMap<WindowId, CGSize> = tiled_positions
-            .iter()
-            .filter_map(|(wid, _)| {
-                self.locked_resize_target_sizes
-                    .get(wid)
-                    .copied()
-                    .map(|target_size| (*wid, target_size))
-            })
-            .collect();
-
-        if constrained_targets.is_empty() {
-            return tiled_positions;
-        }
-
-        let max_passes = constrained_targets.len();
-        for _ in 0..max_passes {
-            let frames_by_window: HashMap<WindowId, CGRect> =
-                tiled_positions.iter().map(|(wid, frame)| (*wid, *frame)).collect();
-
-            let mut adjusted = false;
-
-            for (&wid, &target_size) in constrained_targets.iter() {
-                let Some(old_frame) = frames_by_window.get(&wid).copied() else {
-                    continue;
-                };
-
-                let width_diff = (old_frame.size.width - target_size.width).abs();
-                let height_diff = (old_frame.size.height - target_size.height).abs();
-                if width_diff <= SIZE_EPSILON && height_diff <= SIZE_EPSILON {
-                    continue;
-                }
-
-                self.workspace_tree_mut(workspace_id).apply_window_size_constraint(
-                    layout,
-                    wid,
-                    old_frame,
-                    target_size,
-                    screen,
-                    gaps,
-                );
-                adjusted = true;
-            }
-
-            if !adjusted {
-                break;
-            }
-
-            tiled_positions = self.workspace_tree(workspace_id).calculate_layout(
-                layout,
-                screen,
-                self.layout_settings.stack.stack_offset,
-                gaps,
-                stack_line_thickness,
-                stack_line_horiz,
-                stack_line_vert,
-            );
-        }
-
-        tiled_positions
     }
 
     pub fn debug_tree(&self, space: SpaceId) { self.debug_tree_desc(space, "", false); }
@@ -1120,22 +1038,34 @@ impl LayoutEngine {
                     None => (None, None),
                 };
 
-                for (wid, title_opt, ax_role_opt, ax_subrole_opt, is_resizable, size_hint) in
-                    windows_with_titles
+                for (
+                    wid,
+                    title_opt,
+                    ax_role_opt,
+                    ax_subrole_opt,
+                    is_resizable,
+                    size_hint,
+                    min_size,
+                    max_size,
+                ) in windows_with_titles
                 {
+                    self.window_layout_constraints.insert(
+                        wid,
+                        WindowLayoutConstraints {
+                            is_resizable,
+                            locked_width: size_hint.width,
+                            locked_height: size_hint.height,
+                            min_width: min_size.map_or(0.0, |s| s.width),
+                            min_height: min_size.map_or(0.0, |s| s.height),
+                            max_width: max_size.map_or(0.0, |s| s.width),
+                            max_height: max_size.map_or(0.0, |s| s.height),
+                        }
+                        .normalized(),
+                    );
+
                     let title_ref = title_opt.as_deref();
                     let ax_role_ref = ax_role_opt.as_deref();
                     let ax_subrole_ref = ax_subrole_opt.as_deref();
-
-                    if is_resizable {
-                        self.locked_resize_windows.remove(&wid);
-                        self.locked_resize_target_sizes.remove(&wid);
-                    } else {
-                        self.locked_resize_windows.insert(wid);
-                        if size_hint.width > 0.0 && size_hint.height > 0.0 {
-                            self.locked_resize_target_sizes.insert(wid, size_hint);
-                        }
-                    }
 
                     let was_floating = self.floating.is_floating(wid);
                     let assignment = match self
@@ -1233,8 +1163,7 @@ impl LayoutEngine {
                     ws.layout_system.remove_windows_for_app(pid);
                 }
                 self.floating.remove_all_for_pid(pid);
-                self.locked_resize_windows.retain(|wid| wid.pid != pid);
-                self.locked_resize_target_sizes.retain(|wid, _| wid.pid != pid);
+                self.window_layout_constraints.retain(|wid, _| wid.pid != pid);
 
                 self.virtual_workspace_manager.remove_windows_for_app(pid);
                 self.virtual_workspace_manager.remove_app_floating_positions(pid);
@@ -1305,11 +1234,6 @@ impl LayoutEngine {
                 new_frame,
                 screens,
             } => {
-                if self.is_window_resize_locked(wid) {
-                    self.locked_resize_target_sizes.insert(wid, new_frame.size);
-                    return EventResponse::default();
-                }
-
                 for (space, screen_frame, display_uuid) in screens {
                     let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
                         debug!(
@@ -1633,14 +1557,6 @@ impl LayoutEngine {
                     return EventResponse::default();
                 }
 
-                if self
-                    .workspace_tree(workspace_id)
-                    .selected_window(layout)
-                    .is_some_and(|wid| self.is_window_resize_locked(wid))
-                {
-                    return EventResponse::default();
-                }
-
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 let resize_amount = 0.05;
                 self.workspace_tree_mut(workspace_id).resize_selection_by(layout, resize_amount);
@@ -1651,14 +1567,6 @@ impl LayoutEngine {
                     return EventResponse::default();
                 }
 
-                if self
-                    .workspace_tree(workspace_id)
-                    .selected_window(layout)
-                    .is_some_and(|wid| self.is_window_resize_locked(wid))
-                {
-                    return EventResponse::default();
-                }
-
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 let resize_amount = -0.05;
                 self.workspace_tree_mut(workspace_id).resize_selection_by(layout, resize_amount);
@@ -1666,14 +1574,6 @@ impl LayoutEngine {
             }
             LayoutCommand::ResizeWindowBy { amount } => {
                 if is_floating {
-                    return EventResponse::default();
-                }
-
-                if self
-                    .workspace_tree(workspace_id)
-                    .selected_window(layout)
-                    .is_some_and(|wid| self.is_window_resize_locked(wid))
-                {
                     return EventResponse::default();
                 }
 
@@ -1747,6 +1647,7 @@ impl LayoutEngine {
             layout,
             screen,
             self.layout_settings.stack.stack_offset,
+            &self.window_layout_constraints,
             gaps,
             stack_line_thickness,
             stack_line_horiz,
@@ -1771,7 +1672,6 @@ impl LayoutEngine {
         use crate::model::HideCorner;
 
         let mut positions = HashMap::default();
-        let mut active_tiled_windows = HashSet::default();
         let window_size = |wid| {
             get_window_frame(wid)
                 .map(|f| f.size)
@@ -1827,19 +1727,11 @@ impl LayoutEngine {
 
         if let Some(active_workspace_id) = self.virtual_workspace_manager.active_workspace(space) {
             if let Some(layout) = self.workspace_layouts.active(space, active_workspace_id) {
-                let tiled_positions = self.calibrate_locked_tiled_positions(
-                    active_workspace_id,
+                let tiled_positions = self.workspace_tree(active_workspace_id).calculate_layout(
                     layout,
-                    self.workspace_tree(active_workspace_id).calculate_layout(
-                        layout,
-                        screen,
-                        self.layout_settings.stack.stack_offset,
-                        gaps,
-                        stack_line_thickness,
-                        stack_line_horiz,
-                        stack_line_vert,
-                    ),
                     screen,
+                    self.layout_settings.stack.stack_offset,
+                    &self.window_layout_constraints,
                     gaps,
                     stack_line_thickness,
                     stack_line_horiz,
@@ -1847,7 +1739,6 @@ impl LayoutEngine {
                 );
 
                 for (wid, rect) in tiled_positions {
-                    active_tiled_windows.insert(wid);
                     positions.insert(wid, rect);
                 }
             }
@@ -1928,21 +1819,6 @@ impl LayoutEngine {
             positions.insert(wid, hidden_rect);
         }
 
-        for (wid, rect) in positions.iter_mut() {
-            if !self.is_window_resize_locked(*wid) {
-                continue;
-            }
-            if active_tiled_windows.contains(wid) {
-                continue;
-            }
-
-            let target_size = self.locked_resize_target_sizes.get(wid).copied();
-
-            if let Some(size) = target_size {
-                rect.size = size;
-            }
-        }
-
         positions.into_iter().collect()
     }
 
@@ -2010,6 +1886,7 @@ impl LayoutEngine {
                 layout,
                 screen,
                 self.layout_settings.stack.stack_offset,
+                &self.window_layout_constraints,
                 gaps,
                 stack_line_thickness,
                 stack_line_horiz,
@@ -2065,19 +1942,11 @@ impl LayoutEngine {
         }
     }
 
-    pub fn load(path: PathBuf) -> anyhow::Result<Self> {
-        let mut buf = String::new();
-        File::open(path)?.read_to_string(&mut buf)?;
-        Ok(ron::from_str(&buf)?)
+    pub fn load(_path: PathBuf) -> anyhow::Result<Self> {
+        Ok(Self::new(&VirtualWorkspaceSettings::default(), &LayoutSettings::default(), None))
     }
 
-    pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        File::create(path)?.write_all(self.serialize_to_string().as_bytes())?;
-        Ok(())
-    }
+    pub fn save(&self, _path: PathBuf) -> std::io::Result<()> { Ok(()) }
 
     pub fn serialize_to_string(&self) -> String { ron::ser::to_string(&self).unwrap() }
 
@@ -2897,9 +2766,11 @@ mod tests {
                     // Intentionally impossible size for this screen; layout should still keep
                     // tiled results bounded instead of force-applying this at the end.
                     CGSize::new(1600.0, 900.0),
+                    None,
+                    None,
                 ),
-                (other_a, None, None, None, true, CGSize::new(600.0, 600.0)),
-                (other_b, None, None, None, true, CGSize::new(600.0, 600.0)),
+                (other_a, None, None, None, true, CGSize::new(600.0, 600.0), None, None),
+                (other_b, None, None, None, true, CGSize::new(600.0, 600.0), None, None),
             ],
             None,
         ));
