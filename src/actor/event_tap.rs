@@ -22,11 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventTapOptions as CGTapOpt,
-    CGEventTapProxy, CGEventType,
+    CGEvent, CGEventFlags, CGEventMask, CGEventTapOptions as CGTapOpt, CGEventTapProxy, CGEventType,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -44,8 +42,7 @@ use crate::sys::hotkey::{
     modifiers_from_flags_with_keys,
 };
 use crate::sys::screen::{CoordinateConverter, SpaceId};
-use crate::sys::window_server::{self, WindowServerId};
-use crate::sys::power;
+use crate::sys::{power, window_server};
 use crate::ui::stack_line::point_hits_indicator_frame;
 
 const MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL: u64 = 8_000_000; // 8ms ~= 125 Hz
@@ -90,7 +87,6 @@ unsafe impl Send for EventTap {}
 
 struct State {
     hidden: bool,
-    above_window: Option<WindowServerId>,
     mouse_hides_on_focus: bool,
     focus_follows_mouse_config_enabled: bool,
     default_layout_mode: LayoutMode,
@@ -113,7 +109,6 @@ impl Default for State {
     fn default() -> Self {
         Self {
             hidden: false,
-            above_window: None,
             mouse_hides_on_focus: false,
             focus_follows_mouse_config_enabled: false,
             default_layout_mode: LayoutMode::Traditional,
@@ -239,8 +234,7 @@ impl EventTap {
         let event_mask = build_event_mask(
             disable_hotkey.is_some(),
             state.event_processing_enabled
-                && (state.stack_line_enabled
-                    || Self::focus_follows_mouse_handler_enabled(&state)),
+                && (state.stack_line_enabled || Self::focus_follows_mouse_handler_enabled(&state)),
         );
         EventTap {
             events_tx,
@@ -258,8 +252,9 @@ impl EventTap {
     }
 
     pub async fn run(mut self) {
-        use crate::sys::timer::Timer;
         use tracing::Span;
+
+        use crate::sys::timer::Timer;
 
         enum Tick {
             Request(Request),
@@ -291,8 +286,7 @@ impl EventTap {
         let watchdog = Timer::repeating(Duration::from_secs(5), Duration::from_secs(5));
 
         let mut merged = StreamExt::merge(
-            UnboundedReceiverStream::new(requests_rx)
-                .map(|(span, req)| (span, Tick::Request(req))),
+            UnboundedReceiverStream::new(requests_rx).map(|(span, req)| (span, Tick::Request(req))),
             watchdog.map(|()| (Span::none(), Tick::Watchdog)),
         );
 
@@ -329,8 +323,6 @@ impl EventTap {
             Request::Warp(point) => {
                 if let Err(e) = event::warp_mouse(point) {
                     warn!("Failed to warp mouse: {e:?}");
-                } else {
-                    state.above_window = None;
                 }
                 if state.mouse_hides_on_focus && !state.hidden {
                     debug!("Hiding mouse");
@@ -473,7 +465,9 @@ impl EventTap {
         if let Some(tap) = self.tap.borrow().as_ref() {
             if tap.take_reenabled_flag() {
                 let mut state = self.state.borrow_mut();
-                debug!("Event tap was re-enabled; clearing pressed_keys to prevent phantom modifiers");
+                debug!(
+                    "Event tap was re-enabled; clearing pressed_keys to prevent phantom modifiers"
+                );
                 state.pressed_keys.clear();
                 state.current_flags = CGEvent::flags(Some(event));
                 state.reconcile_modifier_keys();
@@ -572,20 +566,15 @@ impl EventTap {
                     });
                 }
 
-                // ffm — forward deduped window-under-cursor changes to the
-                // reactor. All level-based filtering (popup suppression,
-                // menu-bar gap) happens in the reactor where SLS calls don't
-                // block the event tap.
+                // ffm — forward mouse move coordinates to the reactor.
+                // All level-based filtering and window hit-testing happens in
+                // the reactor so that blocking SLS IPC calls do not stall the
+                // event tap thread.
                 if state.focus_follows_mouse_config_enabled
                     && state.focus_follows_mouse_enabled
                     && !state.disable_hotkey_active
                 {
-                    let wsid = window_from_mouse_event(event);
-                    if let Some(wsid) = wsid {
-                        if state.above_window_changed(wsid) {
-                            _ = self.events_tx.send(Event::MouseMovedOverWindow(wsid));
-                        }
-                    }
+                    _ = self.events_tx.send(Event::MouseMoved(loc));
                 }
             }
             _ => (),
@@ -795,30 +784,12 @@ impl State {
         }
     }
 
-    /// Returns true if the window under the cursor changed.
-    fn above_window_changed(&mut self, wsid: WindowServerId) -> bool {
-        if self.above_window == Some(wsid) {
-            return false;
-        }
-        self.above_window = Some(wsid);
-        true
-    }
-
     fn reset(&mut self, enabled: bool) {
         if enabled {
-            self.above_window = None;
             self.last_mouse_move_loc = None;
             self.last_mouse_move_timestamp = 0;
         }
     }
-}
-
-#[inline]
-fn window_from_mouse_event(event: &CGEvent) -> Option<WindowServerId> {
-    let field_value =
-        CGEvent::integer_value_field(Some(event), CGEventField::MouseEventWindowUnderMousePointer);
-    let id = u32::try_from(field_value).ok()?;
-    (id != 0).then(|| WindowServerId::new(id))
 }
 
 #[inline]
@@ -836,10 +807,7 @@ fn mouse_move_sampling_profile(low_power_mode: bool) -> (u64, f64) {
     }
 }
 
-fn build_event_mask(
-    keyboard_enabled: bool,
-    mouse_move_enabled: bool,
-) -> CGEventMask {
+fn build_event_mask(keyboard_enabled: bool, mouse_move_enabled: bool) -> CGEventMask {
     let mut m: u64 = 0;
     let add = |m: &mut u64, ty: CGEventType| *m |= 1u64 << (ty.0 as u64);
 
