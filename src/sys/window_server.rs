@@ -12,8 +12,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGBitmapInfo, CGColorSpace, CGContext, CGError, CGImage, CGInterpolationQuality, CGWindowID,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowAlpha,
+    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
 
 pub const WINDOWSERVER_QUIET_US: u64 = 350_000;
+const EFFECTIVELY_INVISIBLE_WINDOW_ALPHA: f32 = 0.01;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WindowServerId(pub CGWindowID);
@@ -154,6 +155,9 @@ impl WindowQuery {
 
     #[inline]
     pub fn bounds(&self) -> CGRect { unsafe { SLSWindowIteratorGetBounds(self.iter) } }
+
+    #[inline]
+    pub fn alpha(&self) -> f32 { unsafe { SLSWindowIteratorGetAlpha(self.iter) } }
 
     #[inline]
     #[allow(dead_code)]
@@ -301,19 +305,26 @@ pub fn window_is_ordered_in(id: WindowServerId) -> bool {
     false
 }
 
-fn get_visible_windows_raw<T: Type>() -> CFRetained<CFArray<T>> {
+fn get_windows_raw<T: Type>(
+    options: CGWindowListOption,
+    relative_to_window: CGWindowID,
+) -> CFRetained<CFArray<T>> {
     unsafe {
         // TODO: cgwindowlistcopywindowinfo does not appear to order windows properly
         // SAFETY: this will almost always return (pre objc2 was not a result and just a cfarray)
-        if let Some(windows) = CGWindowListCopyWindowInfo(
-            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
-            kCGNullWindowID,
-        ) {
+        if let Some(windows) = CGWindowListCopyWindowInfo(options, relative_to_window) {
             CFRetained::cast_unchecked(windows)
         } else {
             CFArray::empty()
         }
     }
+}
+
+fn get_visible_windows_raw<T: Type>() -> CFRetained<CFArray<T>> {
+    get_windows_raw(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )
 }
 
 fn make_info(
@@ -322,6 +333,9 @@ fn make_info(
 ) -> Option<WindowServerInfo> {
     let layer = get_num(&win, unsafe { kCGWindowLayer })?.try_into().ok()?;
     if layer_filter.is_some() && layer_filter != Some(layer) {
+        return None;
+    }
+    if window_dict_is_effectively_invisible(&win, layer) {
         return None;
     }
 
@@ -378,26 +392,53 @@ pub fn get_windows(ids: &[WindowServerId]) -> Vec<WindowServerInfo> {
 
     let mut out = Vec::with_capacity(ids.len());
     while query.advance().is_some() {
-        let (min_frame, max_frame) = query.constraints();
-        out.push(WindowServerInfo {
-            id: WindowServerId::new(query.window_id()),
-            pid: query.pid() as i32,
-            layer: query.level(),
-            frame: query.bounds(),
-            min_frame,
-            max_frame,
-        });
+        if let Some(info) = window_info_from_query(&query) {
+            out.push(info);
+        }
     }
     out
 }
 
 pub fn get_window(id: WindowServerId) -> Option<WindowServerInfo> {
-    let mut ws = get_windows(&[id]);
-    (ws.len() == 1).then(|| ws.remove(0))
+    let cf_ids = cf_array_from_ids(&[id]);
+    let query = WindowQuery::new_from_cfarray(CFRetained::as_ptr(&cf_ids).as_ptr(), 1)?;
+    if query.count() != 1 || query.advance().is_none() {
+        return None;
+    }
+    window_info_from_query(&query)
 }
 
 fn get_num(dict: &CFDictionary<CFString, CFType>, key: &'static CFString) -> Option<i64> {
     dict.get(key)?.downcast::<CFNumber>().ok()?.as_i64()
+}
+
+fn get_f64(dict: &CFDictionary<CFString, CFType>, key: &'static CFString) -> Option<f64> {
+    dict.get(key)?.downcast::<CFNumber>().ok()?.as_f64()
+}
+
+fn window_dict_is_effectively_invisible(win: &CFDictionary<CFString, CFType>, layer: i32) -> bool {
+    get_f64(win, unsafe { kCGWindowAlpha })
+        .is_some_and(|alpha| window_is_effectively_invisible(alpha as f32, layer))
+}
+
+fn window_is_effectively_invisible(alpha: f32, layer: i32) -> bool {
+    layer == 0 && alpha <= EFFECTIVELY_INVISIBLE_WINDOW_ALPHA
+}
+
+fn window_info_from_query(query: &WindowQuery) -> Option<WindowServerInfo> {
+    let layer = query.level();
+    if window_is_effectively_invisible(query.alpha(), layer) {
+        return None;
+    }
+    let (min_frame, max_frame) = query.constraints();
+    Some(WindowServerInfo {
+        id: WindowServerId::new(query.window_id()),
+        pid: query.pid() as i32,
+        layer,
+        frame: query.bounds(),
+        min_frame,
+        max_frame,
+    })
 }
 
 /// Find the topmost window at `point`, or the next window below
@@ -489,21 +530,24 @@ pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
 
 pub fn window_sub_level(wid: u32) -> c_int { unsafe { mach_get_window_sub_level(wid) } }
 
+/// Returns the typed Skylight tags exposed by a window-query iterator.
+fn iterator_window_tags(iterator: *mut CFType) -> SLSWindowTags {
+    SLSWindowTags::from_bits_retain(unsafe { SLSWindowIteratorGetTags(iterator) })
+}
+
+/// Returns whether the tags describe a document or floating app window.
+fn tags_match_app_window_role(tags: SLSWindowTags) -> bool {
+    tags.contains(SLSWindowTags::DOCUMENT) || tags.contains(SLSWindowTags::FLOATING)
+}
+
+/// Returns whether the iterator points at a top-level application window.
 fn iterator_window_suitable(iterator: *mut CFType) -> bool {
-    let tags = unsafe { SLSWindowIteratorGetTags(iterator) };
-    let attributes = unsafe { SLSWindowIteratorGetAttributes(iterator) };
+    let tags = iterator_window_tags(iterator);
     let parent_wid = unsafe { SLSWindowIteratorGetParentID(iterator) };
 
-    if parent_wid == 0
-        && ((attributes & 0x2) != 0 || (tags & 0x400000000000000) != 0)
-        && (tags & SLSWindowTags::Attached) != 0
-        && (tags & SLSWindowTags::IgnoresCycle) != 0
-        && ((tags & SLSWindowTags::Document) != 0
-            || ((tags & SLSWindowTags::Floating) != 0 && (tags & SLSWindowTags::Modal) != 0))
-    {
-        return true;
-    }
-    return false;
+    // Previous Rust filter also required attribute/high-bit hints plus
+    // ATTACHED, IGNORES_CYCLE, and DOCUMENT or (FLOATING && MODAL).
+    parent_wid == 0 && tags_match_app_window_role(tags)
 }
 
 // credit to yabai
@@ -547,30 +591,12 @@ pub fn space_window_list_for_connection(
     let mut windows = Vec::with_capacity(expected as usize);
 
     while unsafe { SLSWindowIteratorAdvance(iterator) } {
-        let tags = unsafe { SLSWindowIteratorGetTags(iterator) };
-        let attributes = unsafe { SLSWindowIteratorGetAttributes(iterator) };
+        let tags = iterator_window_tags(iterator);
         let parent_id = unsafe { SLSWindowIteratorGetParentID(iterator) };
         let wid = unsafe { SLSWindowIteratorGetWindowID(iterator) };
-        let level = unsafe { SLSWindowIteratorGetLevel(iterator) };
-
-        let is_candidate = if include_minimized {
-            if parent_id != 0 || !matches!(level, 0 | 3 | 8) {
-                false
-            } else if ((attributes & 0x2) != 0 || (tags & 0x0400_0000_0000_0000) != 0)
-                && ((tags & 0x1) != 0 || ((tags & 0x2) != 0 && (tags & 0x8000_0000) != 0))
-            {
-                true
-            } else {
-                (attributes == 0 || attributes == 1)
-                    && ((tags & 0x1000_0000_0000_0000) != 0 || (tags & 0x0300_0000_0000_0000) != 0)
-                    && ((tags & 0x1) != 0 || ((tags & 0x2) != 0 && (tags & 0x8000_0000) != 0))
-            }
-        } else {
-            parent_id == 0
-                && matches!(level, 0 | 3 | 8)
-                && (((attributes & 0x2) != 0) || (tags & 0x0400_0000_0000_0000) != 0)
-                && ((tags & 0x1) != 0 || ((tags & 0x2) != 0 && (tags & 0x8000_0000) != 0))
-        };
+        // Previous Rust path also checked level, attributes, and
+        // fullscreen/minimized tag hints before accepting the window.
+        let is_candidate = parent_id == 0 && tags_match_app_window_role(tags);
 
         if is_candidate {
             windows.push(wid);
