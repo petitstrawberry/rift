@@ -395,6 +395,60 @@ fn workspace_switch_batches_all_windows_with_eui_enabled() {
 }
 
 #[test]
+fn auto_workspace_switch_focuses_activated_window_not_stale_workspace_focus() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+    let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
+    reactor.communication_manager.raise_manager_tx = raise_manager_tx;
+
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let stale_focus = WindowId::new(1, 1);
+    let activated = WindowId::new(2, 1);
+
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    reactor.handle_events(apps.make_app(2, make_windows(1)));
+    apps.simulate_until_quiet(&mut reactor);
+
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space, stale_focus));
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::MoveWindowToWorkspace { workspace: 1, window_id: None },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space, activated));
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::MoveWindowToWorkspace { workspace: 1, window_id: None },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::SwitchToWorkspace(1),
+    )));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space, stale_focus));
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::SwitchToWorkspace(0),
+    )));
+    while raise_manager_rx.try_recv().is_ok() {}
+
+    reactor.maybe_auto_switch_to_window_workspace(activated.pid, activated, space);
+
+    let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
+    match msg {
+        raise_manager::Event::RaiseRequest(RaiseRequest { focus_window, focus_quiet, .. }) => {
+            assert_eq!(focus_window.map(|(wid, _)| wid), Some(activated));
+            assert_eq!(focus_quiet, Quiet::Yes);
+        }
+        _ => panic!("Unexpected event: {msg:?}"),
+    }
+}
+
+#[test]
 fn windows_discovered_does_not_reintroduce_inactive_workspace_window() {
     let mut apps = Apps::new();
     let mut reactor = Reactor::new_for_test(LayoutEngine::new(
@@ -1597,5 +1651,158 @@ fn discovery_after_display_change_places_window_on_correct_display() {
         screen2,
         apps.windows[&WindowId::new(1, 1)].frame,
         "window must be laid out on screen2"
+    );
+}
+
+#[test]
+fn discovery_minimize_transition_removes_window_from_layout() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let wid = WindowId::new(1, 1);
+
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+    reactor.handle_events(apps.make_app(1, make_windows(1)));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert!(has_window_in_layout(&mut reactor, space, screen, wid));
+
+    reactor.handle_event(Event::WindowsDiscovered {
+        pid: 1,
+        new: vec![(wid, WindowInfo {
+            is_minimized: true,
+            ..make_window(1)
+        })],
+        known_visible: vec![],
+    });
+
+    assert!(
+        !has_window_in_layout(&mut reactor, space, screen, wid),
+        "minimized window must be removed from layout when discovery reports it minimized"
+    );
+    assert!(
+        reactor
+            .window_manager
+            .window(wid)
+            .is_some_and(|window| window.info.is_minimized),
+        "reactor state must keep the window marked minimized"
+    );
+}
+
+#[test]
+fn discovery_restore_transition_readds_window_to_layout() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let wid = WindowId::new(1, 1);
+    let mut windows = make_windows(1);
+    windows[0].is_minimized = true;
+
+    reactor.handle_event(screen_params_event(vec![screen], vec![Some(space)], vec![]));
+    reactor.handle_events(apps.make_app(1, windows));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert!(
+        !has_window_in_layout(&mut reactor, space, screen, wid),
+        "startup-minimized window must not be inserted into layout"
+    );
+
+    reactor.handle_event(Event::WindowsDiscovered {
+        pid: 1,
+        new: vec![(wid, make_window(1))],
+        known_visible: vec![wid],
+    });
+
+    assert!(
+        has_window_in_layout(&mut reactor, space, screen, wid),
+        "restored window must return to layout when discovery reports it visible again"
+    );
+    assert!(
+        reactor
+            .window_manager
+            .window(wid)
+            .is_some_and(|window| !window.info.is_minimized),
+        "reactor state must clear the minimized flag after restore"
+    );
+}
+
+#[test]
+fn unfullscreen_restores_window_tracking() {
+    let mut apps = Apps::new();
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings::default(),
+        None,
+    ));
+
+    let user_space = SpaceId::new(1);
+    let fullscreen_space = SpaceId::new(0x400000000 + user_space.get());
+    let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+
+    // Set up a display with a user space and some windows.
+    reactor.handle_event(screen_params_event(
+        vec![full_screen],
+        vec![Some(user_space)],
+        vec![],
+    ));
+    reactor.handle_events(apps.make_app_with_opts(
+        1,
+        make_windows(1),
+        Some(WindowId::new(1, 1)),
+        true,
+        true,
+    ));
+    reactor.handle_event(Event::ApplicationGloballyActivated(1));
+    apps.simulate_until_quiet(&mut reactor);
+
+    // Record the window as fullscreened.
+    let window_id = WindowId::new(1, 1);
+    reactor.space_manager.fullscreen_by_space.insert(
+        fullscreen_space.get(),
+        FullscreenSpaceTrack {
+            windows: vec![FullscreenWindowTrack {
+                pid: 1,
+                window_id: Some(window_id),
+                last_known_user_space: Some(user_space),
+                _last_seen_fullscreen_space: fullscreen_space,
+            }],
+        },
+    );
+
+    // Transition to fullscreen space.
+    reactor.handle_event(Event::SpaceChanged(vec![Some(fullscreen_space)]));
+    apps.simulate_until_quiet(&mut reactor);
+
+    // Exit fullscreen (return to user space).
+    reactor.handle_event(Event::SpaceChanged(vec![Some(user_space)]));
+
+    // The reactor should trigger a GetVisibleWindows request.
+    let mut saw_get_visible_windows = false;
+    for request in apps.requests() {
+        if matches!(request, Request::GetVisibleWindows) {
+            saw_get_visible_windows = true;
+        }
+    }
+    assert!(
+        saw_get_visible_windows,
+        "Should send GetVisibleWindows to app on unfullscreen"
+    );
+
+    // The fullscreen track should be removed.
+    assert!(
+        !reactor.space_manager.fullscreen_by_space.contains_key(&fullscreen_space.get()),
+        "Fullscreen track should be removed from space manager"
     );
 }
