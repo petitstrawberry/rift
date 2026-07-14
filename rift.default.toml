@@ -120,6 +120,9 @@ invert_horizontal = false
 # Number of fingers required for gesture
 fingers = 3
 # If true, scrolling past the end of the strip will trigger a workspace switch
+#
+# This enables a seemingly endless scroll experience through each workspace's
+# strip of windows
 propagate_to_workspace_swipe = false
 
 [settings.layout.stack]
@@ -351,6 +354,7 @@ comb1 = "Alt + Shift"
 
 # Commands
 # - toggle_space_activated
+# - reload_config
 # - next_workspace / prev_workspace
 # - next_workspace = true|false (optional skip-empty override)
 # - prev_workspace = true|false (optional skip-empty override)
@@ -365,6 +369,7 @@ comb1 = "Alt + Shift"
 # - move_focus = "left"|"right"|"up"|"down"
 # - move_node = "left"|"right"|"up"|"down"
 # - join_window = "left"|"right"|"up"|"down"
+# - consume_or_expel_window = "left"|"right"|"up"|"down"
 # - toggle_stack / toggle_orientation / unjoin_windows
 # - toggle_focus_floating / toggle_window_floating / toggle_fullscreen / toggle_fullscreen_within_gaps
 # - resize_window_grow / resize_window_shrink / resize_window_by = 0.05
@@ -372,7 +377,7 @@ comb1 = "Alt + Shift"
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
 # - move_window_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", window_id = 123 }
-# - close_window = { window_server_id = 123 }
+# - close_window / close_window = { window_server_id = 123 } (optional window id)
 # - focus_window = { window_id = 123, window_server_id = 456 }
 # - show_mission_control_all / show_mission_control_current / dismiss_mission_control (this is rift's own mission control, not macOS's)
 

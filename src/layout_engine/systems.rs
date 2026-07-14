@@ -120,6 +120,7 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId>;
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId);
     fn remove_window(&mut self, wid: WindowId);
+    fn remove_window_and_rebalance_parent(&mut self, wid: WindowId) { self.remove_window(wid) }
     fn remove_windows_for_app(&mut self, pid: pid_t);
     fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId>;
     fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>);
@@ -151,6 +152,9 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool;
 
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);
+    fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
+        self.join_selection_with_direction(layout, direction);
+    }
     fn apply_stacking_to_parent_of_selection(
         &mut self,
         layout: LayoutId,
