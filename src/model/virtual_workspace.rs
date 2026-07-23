@@ -8,7 +8,7 @@ use crate::common::collections::HashMap;
 #[cfg(test)]
 use crate::common::config::AppWorkspaceRule;
 use crate::common::config::{
-    LayoutMode, LayoutSettings, VirtualWorkspaceSettings, WorkspaceSelector,
+    LayoutMode, LayoutSettings, MAX_WORKSPACES, VirtualWorkspaceSettings, WorkspaceSelector,
 };
 use crate::common::log::trace_misc;
 use crate::layout_engine::Direction;
@@ -177,8 +177,7 @@ impl WorkspaceStore {
         config: &VirtualWorkspaceSettings,
         layout_settings: &LayoutSettings,
     ) -> Self {
-        let max_workspaces = 32;
-        let target_count = config.default_workspace_count.max(1).min(max_workspaces);
+        let target_count = config.default_workspace_count.max(1).min(MAX_WORKSPACES);
         let default_workspace = config.default_workspace.min(target_count - 1);
 
         Self {
@@ -188,7 +187,7 @@ impl WorkspaceStore {
             workspace_counter: 1,
             #[cfg(test)]
             test_app_rules: crate::model::AppRuleEngine::new(&config.app_rules),
-            max_workspaces,
+            max_workspaces: MAX_WORKSPACES,
             default_workspace_count: config.default_workspace_count,
             default_workspace_names: config.workspace_names.clone(),
             default_workspace,
@@ -204,6 +203,11 @@ impl WorkspaceStore {
         config: &VirtualWorkspaceSettings,
         layout_settings: &LayoutSettings,
     ) {
+        // Runtime-only limits are skipped by layout snapshots and therefore
+        // deserialize to zero. Rehydrate them before doing count arithmetic.
+        if self.max_workspaces == 0 {
+            self.max_workspaces = MAX_WORKSPACES;
+        }
         self.workspace_rules = config.workspace_rules.clone();
         self.default_layout_mode = layout_settings.mode;
         self.layout_settings = layout_settings.clone();
@@ -791,21 +795,48 @@ impl WorkspaceStore {
             return;
         }
         for workspace in self.workspaces.values_mut() {
-            if workspace.last_focused() == Some(from) {
+            let contained_from = workspace.last_focused() == Some(from);
+            if workspace.last_focused() == Some(to) {
+                workspace.set_last_focused(None);
+            }
+            if contained_from {
                 workspace.set_last_focused(Some(to));
+            }
+        }
+    }
+
+    pub(crate) fn forget_window_identity(&mut self, window: WindowId) {
+        for workspace in self.workspaces.values_mut() {
+            if workspace.last_focused() == Some(window) {
+                workspace.set_last_focused(None);
+            }
+        }
+    }
+
+    pub(crate) fn retain_window_focus_location(
+        &mut self,
+        window: WindowId,
+        keep: VirtualWorkspaceId,
+    ) {
+        for (workspace_id, workspace) in self.workspaces.iter_mut() {
+            if workspace_id != keep && workspace.last_focused() == Some(window) {
+                workspace.set_last_focused(None);
             }
         }
     }
 
     pub fn list_workspaces(&mut self, space: SpaceId) -> Vec<(VirtualWorkspaceId, String)> {
         self.ensure_space_initialized(space);
+        self.existing_workspaces(space)
+    }
+
+    /// Read workspace topology without creating missing state. Validation and restore planning
+    /// must use this accessor so a failed transaction cannot initialize part of the live engine.
+    pub(crate) fn existing_workspaces(&self, space: SpaceId) -> Vec<(VirtualWorkspaceId, String)> {
         let ids = self.workspaces_by_space.get(&space).cloned().unwrap_or_default();
-        let workspaces: Vec<_> = ids
-            .into_iter()
+        ids.into_iter()
             .filter_map(|id| self.workspaces.get(id).map(|ws| (id, ws.name.clone())))
-            .collect();
-        //workspaces.sort_by(|a, b| a.1.cmp(&b.1));
-        workspaces
+            .collect()
     }
 
     pub fn rename_workspace(

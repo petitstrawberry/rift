@@ -501,6 +501,13 @@ impl LayoutSystem for TraditionalLayoutSystem {
         self.tree.data.window.at(selection)
     }
 
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        self.root(layout)
+            .traverse_preorder(&self.tree.map)
+            .filter_map(|node| self.tree.data.window.at(node))
+            .collect()
+    }
+
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
         let root = self.root(layout);
         self.visible_windows_under_internal(root)
@@ -580,6 +587,10 @@ impl LayoutSystem for TraditionalLayoutSystem {
             node
         };
         self.select(node);
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        self.tree.data.window.replace_window(from, to);
     }
 
     fn remove_window(&mut self, wid: WindowId) {
@@ -2179,6 +2190,20 @@ impl WindowIndex {
             .or_default()
             .0
             .push(WindowNodeInfo { layout, node });
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        if from == to {
+            return;
+        }
+        let nodes = self.window_nodes.remove(&from).unwrap_or_default();
+        if nodes.0.is_empty() {
+            return;
+        }
+        for info in &nodes.0 {
+            self.windows.insert(info.node, to);
+        }
+        self.window_nodes.entry(to).or_default().0.extend(nodes.0);
     }
 
     fn take_nodes_for(&mut self, wid: WindowId) -> impl Iterator<Item = (LayoutId, NodeId)> {

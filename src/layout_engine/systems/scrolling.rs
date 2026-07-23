@@ -924,6 +924,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
         self.layout_state(layout).and_then(|state| state.selected_or_first())
     }
 
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        self.layout_state(layout).map(Self::all_windows).unwrap_or_default()
+    }
+
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
         self.layout_state(layout).map(Self::all_windows).unwrap_or_default()
     }
@@ -1024,6 +1028,33 @@ impl LayoutSystem for ScrollingLayoutSystem {
         }
         if niri_navigation {
             state.reveal_selected_without_direction();
+        }
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        if from == to {
+            return;
+        }
+        for state in self.layouts.values_mut() {
+            for column in &mut state.columns {
+                for window in &mut column.windows {
+                    if *window == from {
+                        *window = to;
+                    }
+                }
+            }
+            if state.selected == Some(from) {
+                state.selected = Some(to);
+            }
+            if state.center_override_window == Some(from) {
+                state.center_override_window = Some(to);
+            }
+            if state.fullscreen.remove(&from) {
+                state.fullscreen.insert(to);
+            }
+            if state.fullscreen_within_gaps.remove(&from) {
+                state.fullscreen_within_gaps.insert(to);
+            }
         }
     }
 

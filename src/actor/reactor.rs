@@ -156,7 +156,11 @@ pub enum SpaceEventKind {
 pub enum Event {
     #[serde(skip)]
     SpaceStateChanged(ForwardedSpaceState),
-
+    #[serde(skip)]
+    ActiveDisplayChanged {
+        menu_bar_space: Option<SpaceId>,
+        command_space: Option<SpaceId>,
+    },
     /// An application was launched. This event is also sent for every running
     /// application on startup.
     ///
@@ -182,6 +186,10 @@ pub enum Event {
     ApplicationGloballyActivated(pid_t),
     ApplicationGloballyDeactivated(pid_t),
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
+    /// Authoritative focus resolved from WindowServer's key-focus process and
+    /// the z-ordered windows on the active native space.
+    #[serde(skip)]
+    WindowServerFocusChanged(WindowId, SpaceId),
 
     WindowsDiscovered {
         pid: pid_t,
@@ -901,7 +909,6 @@ impl Reactor {
         matches!(
             event,
             Event::WindowCreated(..)
-                | Event::WindowDestroyed(..)
                 | Event::WindowServerDestroyed(..)
                 | Event::WindowServerAppeared(..)
                 | Event::WindowFrameChanged(..)
@@ -1086,6 +1093,23 @@ impl Reactor {
                     }
                 }
             }
+            Event::WindowServerFocusChanged(window, reported_space) => {
+                if self.layout_manager.layout_engine.focused_window() == Some(window) {
+                    return Ok(EventOutcome::default());
+                }
+                if !self.state.windows.contains_window(window) {
+                    if let Some(app) = self.app_manager.apps.get(&window.pid) {
+                        let _ = app.handle.send(Request::GetVisibleWindows);
+                    }
+                    return Ok(EventOutcome::default());
+                }
+                return Ok(if self.is_space_active(reported_space) {
+                    EventOutcome::default()
+                        .with_layout_event(LayoutEvent::WindowFocused(reported_space, window))
+                } else {
+                    EventOutcome::default()
+                });
+            }
             Event::RegisterWmSender(sender) => {
                 return Ok(system_workflow::handle_register_wm_sender(
                     &mut self.communication_manager,
@@ -1134,7 +1158,12 @@ impl Reactor {
                     window_server::get_window(window_server_id)
                         .is_some_and(|info| info.pid == wid.pid)
                 });
-                let mut outcome = if platform_window_alive {
+                // While lifecycle/display refreshes are quarantined, a negative
+                // WindowServer lookup is not authoritative. Detach the dead AX state
+                // now so it cannot remain in layout, and let the stabilized native
+                // snapshot either rediscover or permanently retire the record.
+                let native_existence_uncertain = self.refreshes_blocked();
+                let mut outcome = if platform_window_alive || native_existence_uncertain {
                     window_workflow::handle_window_invalidated(
                         &mut self.state,
                         &self.transaction_manager,
@@ -1351,6 +1380,11 @@ impl Reactor {
                 }
                 return Ok(outcome);
             }
+            Event::ActiveDisplayChanged { menu_bar_space, command_space } => {
+                self.space_state.menu_bar_space = menu_bar_space;
+                self.space_state.command_space = command_space;
+                return Ok(EventOutcome::default());
+            }
             Event::MouseUp => {
                 let pending_swap = self.get_pending_drag_swap();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(true);
@@ -1477,8 +1511,31 @@ impl Reactor {
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
                 return command_workflow::handle_command_reactor_save_and_exit(
-                    &self.layout_manager,
+                    &self.state,
+                    &mut self.layout_manager,
                 );
+            }
+            Event::Command(Command::Reactor(ReactorCommand::SaveLayout { path })) => {
+                return command_workflow::handle_command_reactor_save_layout(
+                    &self.state,
+                    &mut self.layout_manager,
+                    path,
+                );
+            }
+            Event::Command(Command::Reactor(ReactorCommand::RestoreLayout { path, scope })) => {
+                let Some(active_space) = self.active_display_space() else {
+                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                };
+                if let Err(error) = self.layout_manager.layout_engine.restore_layout(
+                    path,
+                    layout::RestoreRequest::new(scope, active_space),
+                    &mut self.state.windows,
+                    &self.config.virtual_workspaces,
+                    &self.config.settings.layout,
+                ) {
+                    tracing::error!(?scope, %error, "Could not restore saved layout");
+                }
+                return Ok(EventOutcome::finalized_event(None, false, false, true));
             }
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 let serialized = self.serialize_state();

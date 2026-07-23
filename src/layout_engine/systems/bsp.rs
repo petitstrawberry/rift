@@ -1052,6 +1052,14 @@ impl LayoutSystem for BspLayoutSystem {
         self.layouts.get(layout).and_then(|s| self.selection_window(s))
     }
 
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        let mut out = Vec::new();
+        if let Some(state) = self.layouts.get(layout).copied() {
+            self.collect_windows_under(state.root, &mut out);
+        }
+        out
+    }
+
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
         let mut out = Vec::new();
         if let Some(state) = self.layouts.get(layout).copied() {
@@ -1136,6 +1144,21 @@ impl LayoutSystem for BspLayoutSystem {
                 // Fall back to default insertion
                 self.insert_window_at_selection(layout, wid);
             }
+        }
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        if from == to {
+            return;
+        }
+        let Some(node) = self.window_to_node.remove(&from) else {
+            return;
+        };
+        if let Some(NodeKind::Leaf { window, .. }) = self.kind.get_mut(node)
+            && *window == Some(from)
+        {
+            *window = Some(to);
+            self.window_to_node.insert(to, node);
         }
     }
 

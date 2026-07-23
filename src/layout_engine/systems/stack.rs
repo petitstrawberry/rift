@@ -184,6 +184,10 @@ impl LayoutSystem for StackLayoutSystem {
         self.inner.selected_window(layout)
     }
 
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        self.windows_in_layout_preorder(layout)
+    }
+
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
         self.inner.visible_windows_in_layout(layout)
     }
@@ -214,6 +218,10 @@ impl LayoutSystem for StackLayoutSystem {
         self.normalize_layout(layout);
         let node = self.inner.add_window_under(layout, self.inner.root(layout), wid);
         self.inner.select(node);
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        self.inner.replace_window(from, to);
     }
 
     fn remove_window(&mut self, wid: WindowId) {

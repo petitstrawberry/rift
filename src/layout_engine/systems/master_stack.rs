@@ -561,6 +561,10 @@ impl LayoutSystem for MasterStackLayoutSystem {
         self.inner.selected_window(layout)
     }
 
+    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
+        MasterStackLayoutSystem::all_windows_in_layout(self, layout)
+    }
+
     fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
         self.inner.visible_windows_in_layout(layout)
     }
@@ -607,6 +611,10 @@ impl LayoutSystem for MasterStackLayoutSystem {
             .unwrap_or_else(|| self.inner.add_window_under(layout, target, wid));
         self.inner.select(node);
         self.enforce_master_count(layout, master, stack);
+    }
+
+    fn replace_window(&mut self, from: WindowId, to: WindowId) {
+        self.inner.replace_window(from, to);
     }
 
     fn remove_window(&mut self, wid: WindowId) {
