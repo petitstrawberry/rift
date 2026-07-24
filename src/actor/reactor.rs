@@ -1510,32 +1510,50 @@ impl Reactor {
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
+                let active_space = self.active_display_space();
                 return command_workflow::handle_command_reactor_save_and_exit(
                     &self.state,
                     &mut self.layout_manager,
+                    active_space,
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveLayout { path })) => {
+                let active_space = self.active_display_space();
                 return command_workflow::handle_command_reactor_save_layout(
                     &self.state,
                     &mut self.layout_manager,
                     path,
+                    active_space,
                 );
             }
-            Event::Command(Command::Reactor(ReactorCommand::RestoreLayout { path, scope })) => {
+            Event::Command(Command::Reactor(ReactorCommand::RestoreLayout {
+                path,
+                scope,
+                source,
+            })) => {
                 let Some(active_space) = self.active_display_space() else {
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::finalized_event(None, false, false, false)
+                        .with_stdout_line(
+                            "Could not restore saved layout: no active macOS space is available"
+                                .into(),
+                        ));
                 };
-                if let Err(error) = self.layout_manager.layout_engine.restore_layout(
+                let request = layout::RestoreRequest { scope, active_space, source };
+                let outcome = EventOutcome::finalized_event(None, false, false, true);
+                let report = self.layout_manager.layout_engine.restore_layout(
                     path,
-                    layout::RestoreRequest::new(scope, active_space),
+                    request,
                     &mut self.state.windows,
                     &self.config.virtual_workspaces,
                     &self.config.settings.layout,
-                ) {
-                    tracing::error!(?scope, %error, "Could not restore saved layout");
-                }
-                return Ok(EventOutcome::finalized_event(None, false, false, true));
+                );
+                return Ok(match report {
+                    Ok(report) => outcome.with_stdout_line(report.summary()),
+                    Err(error) => {
+                        tracing::error!(?scope, %error, "Could not restore saved layout");
+                        outcome.with_stdout_line(format!("Could not restore saved layout: {error}"))
+                    }
+                });
             }
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 let serialized = self.serialize_state();
@@ -2280,6 +2298,10 @@ impl Reactor {
         );
         self.check_for_new_windows();
 
+        if let Some(space) = self.workspace_command_space() {
+            self.focus_desktop_if_active_workspace_empty(space);
+        }
+
         if let Some(space) = self
             .workspace_command_space()
             .or_else(|| spaces.iter().copied().flatten().find(|space| self.is_space_active(*space)))
@@ -2409,6 +2431,16 @@ impl Reactor {
             command_space_only_update,
             invalidates_pending_targets,
         } = analysis;
+
+        let current_display_spaces = screens
+            .iter()
+            .filter_map(|screen| screen.space.map(|space| (space, screen.display_uuid.clone())))
+            .collect::<Vec<_>>();
+        self.layout_manager.layout_engine.reconcile_startup_spaces(
+            &mut self.state.windows,
+            &current_display_spaces,
+            screens.len(),
+        );
 
         self.space_state.has_seen_display_set = has_seen_display_set;
         self.space_state.fullscreen_spaces = fullscreen_spaces;
@@ -3200,11 +3232,19 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        let focus_desktop = matches!(
+            event,
+            LayoutEvent::WindowRemoved(wid)
+                if self.layout_manager.layout_engine.focused_window() == Some(wid)
+        );
         let event_clone = event.clone();
         let response =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, None);
+        if focus_desktop && let Some(space) = self.workspace_command_space() {
+            self.focus_desktop_if_active_workspace_empty(space);
+        }
         for space in self.space_state.iter_known_spaces() {
             self.layout_manager.layout_engine.debug_tree_desc(space, "after event", false);
         }
@@ -3712,12 +3752,14 @@ impl Reactor {
                                 .is_empty()
                         })
                         .unwrap_or(false);
-                    let warp_space = if skip_center_warp {
-                        None
+                    if skip_center_warp {
+                        workspace_switch_space.is_some_and(|space| {
+                            self.focus_desktop_if_active_workspace_empty(space)
+                        })
                     } else {
-                        workspace_switch_space.or_else(|| self.command_context_space())
-                    };
-                    self.try_focus_or_warp_without_raise(warp_space, &mut focus_window)
+                        let space = workspace_switch_space.or_else(|| self.command_context_space());
+                        self.try_focus_or_warp_without_raise(space, &mut focus_window)
+                    }
                 }
             } else if let Some(space) = pending_refocus_space.take() {
                 if let Some(wid) = self.last_focused_window_in_space(space) {
@@ -4013,6 +4055,31 @@ impl Reactor {
 
         let Some(info) = window_info else { return false };
         window_server::make_key_window(info.pid, wsid).is_ok()
+    }
+
+    fn focus_desktop_if_active_workspace_empty(&mut self, space: SpaceId) -> bool {
+        if !self.is_space_active(space)
+            || !self
+                .layout_manager
+                .layout_engine
+                .windows_in_active_workspace(&self.state.windows, space)
+                .is_empty()
+        {
+            return false;
+        }
+        let Some(screen) = self.space_state.screen_by_space(space) else {
+            return false;
+        };
+        if !window_server::focus_desktop_window(screen) {
+            return false;
+        }
+
+        self.layout_manager.layout_engine.commit_workspace_focus(
+            &mut self.state.windows,
+            space,
+            None,
+        );
+        true
     }
 
     fn last_focused_window_in_space(&self, space: SpaceId) -> Option<WindowId> {
