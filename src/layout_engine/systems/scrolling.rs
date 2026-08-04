@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{ScrollingFocusNavigationStyle, ScrollingLayoutSettings};
+use crate::common::config::{
+    ScrollingFocusNavigationStyle, ScrollingLayoutSettings, WindowInsertionPoint,
+};
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
 use crate::layout_engine::utils::compute_tiling_area;
@@ -322,6 +324,22 @@ impl ScrollingLayoutSystem {
 
     pub fn update_settings(&mut self, settings: &ScrollingLayoutSettings) {
         self.settings = settings.clone();
+    }
+
+    fn insert_new_column(
+        state: &mut LayoutState,
+        wid: WindowId,
+        insertion_point: WindowInsertionPoint,
+    ) {
+        if insertion_point == WindowInsertionPoint::EndOfTree {
+            state.insert_column_at_end(wid);
+        } else if let Some((col_idx, _)) = state.selected_location() {
+            state.insert_column_after(col_idx, wid);
+        } else if !state.columns.is_empty() {
+            state.insert_column_after(0, wid);
+        } else {
+            state.insert_column_at_end(wid);
+        }
     }
 
     fn clamp_ratio(&self, ratio: f64) -> f64 {
@@ -1018,16 +1036,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
             self.settings.focus_navigation_style,
             ScrollingFocusNavigationStyle::Niri
         );
+        let insertion_point = self.settings.base.window_insertion_point.unwrap_or_default();
         let Some(state) = self.layout_state_mut(layout) else {
             return;
         };
-        if let Some((col_idx, _)) = state.selected_location() {
-            state.insert_column_after(col_idx, wid);
-        } else if !state.columns.is_empty() {
-            state.insert_column_after(0, wid);
-        } else {
-            state.insert_column_at_end(wid);
-        }
+        Self::insert_new_column(state, wid, insertion_point);
         if niri_navigation {
             state.reveal_selected_without_direction();
         }
@@ -1098,6 +1111,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
             self.settings.focus_navigation_style,
             ScrollingFocusNavigationStyle::Niri
         );
+        let insertion_point = self.settings.base.window_insertion_point.unwrap_or_default();
         let Some(state) = self.layout_state_mut(layout) else {
             return;
         };
@@ -1120,11 +1134,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
                     current_iter.next();
                 }
                 (Some(des), None) => {
-                    state.insert_column_at_end(**des);
+                    Self::insert_new_column(state, **des, insertion_point);
                     desired_iter.next();
                 }
                 (Some(des), Some(cur)) if des < cur => {
-                    state.insert_column_at_end(**des);
+                    Self::insert_new_column(state, **des, insertion_point);
                     desired_iter.next();
                 }
                 (_, Some(cur)) => {
@@ -1659,7 +1673,7 @@ mod tests {
     use super::{Column, ScrollingLayoutSystem};
     use crate::actor::app::{WindowId, pid_t};
     use crate::common::collections::HashMap;
-    use crate::common::config::{GapSettings, ScrollingLayoutSettings};
+    use crate::common::config::{GapSettings, ScrollingLayoutSettings, WindowInsertionPoint};
     use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
     use crate::layout_engine::utils::compute_tiling_area;
     use crate::layout_engine::{Direction, LayoutId, ResizeOrientation};
@@ -2589,5 +2603,44 @@ mod tests {
         // With 2 columns, they should respect the configured column_width_ratio (0.4 * 1000 = 400.0)
         assert!((w1_frame2.size.width - 400.0).abs() < 1.0);
         assert!((w2_frame2.size.width - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn app_reconciliation_honors_updated_next_to_selection_policy() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::EndOfTree);
+        let mut system = ScrollingLayoutSystem::new(&settings);
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        let w3 = wid(1, 3);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        assert!(system.select_window(layout, w1));
+
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::NextToSelection);
+        system.update_settings(&settings);
+        system.set_windows_for_app(layout, 1, vec![w1, w2, w3]);
+
+        assert_eq!(system.all_windows_in_layout(layout), vec![w1, w3, w2]);
+    }
+
+    #[test]
+    fn app_reconciliation_honors_updated_end_of_tree_policy() {
+        let mut settings = ScrollingLayoutSettings::default();
+        let mut system = ScrollingLayoutSystem::new(&settings);
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        let w3 = wid(1, 3);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        assert!(system.select_window(layout, w1));
+
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::EndOfTree);
+        system.update_settings(&settings);
+        system.set_windows_for_app(layout, 1, vec![w1, w2, w3]);
+
+        assert_eq!(system.all_windows_in_layout(layout), vec![w1, w2, w3]);
     }
 }

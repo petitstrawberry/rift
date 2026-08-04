@@ -91,7 +91,9 @@ use crate::common::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::config::Config;
 use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
 use crate::model::RiftState;
-use crate::model::broadcast::{BroadcastEvent, BroadcastSender};
+use crate::model::broadcast::{
+    BroadcastEvent, BroadcastSender, protocol_window_id, protocol_workspace_id,
+};
 use crate::model::space_activation::{SpaceActivationConfig, SpaceActivationPolicy};
 use crate::model::tx_store::WindowTxStore;
 use crate::model::virtual_workspace::AppRuleResult;
@@ -143,7 +145,7 @@ impl std::ops::Deref for ReactorHandle {
     fn deref(&self) -> &Self::Target { &self.queries }
 }
 
-use crate::model::server::WindowData;
+use crate::model::server::RuntimeWindowData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceEventKind {
@@ -939,15 +941,17 @@ impl Reactor {
     }
 
     fn flush_deferred_visible_refresh(&mut self) {
-        if self.refreshes_blocked() || !self.refresh_quarantine_manager.pending_visible_refresh {
+        if self.refreshes_blocked() {
             return;
         }
 
-        let track_mission_control_refresh =
-            self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control;
-        self.refresh_quarantine_manager.pending_visible_refresh = false;
-        self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control = false;
-        self.request_visible_windows_for_apps(track_mission_control_refresh);
+        if self.refresh_quarantine_manager.pending_visible_refresh {
+            let track_mission_control_refresh =
+                self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control;
+            self.refresh_quarantine_manager.pending_visible_refresh = false;
+            self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control = false;
+            self.request_visible_windows_for_apps(track_mission_control_refresh);
+        }
     }
 
     // All lifecycle churn is upstreamed through the spaces actor. The reactor
@@ -979,15 +983,21 @@ impl Reactor {
 
     #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
     fn handle_event(&mut self, event: Event) {
+        let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
-            Ok(outcome) => self.apply_event_outcome(outcome),
+            Ok(mut outcome) => {
+                let focused_window = self.main_window();
+                if focused_window != previously_focused_window
+                    && let Some(focused_window) = focused_window
+                {
+                    outcome = outcome.with_focused_window_broadcast(focused_window);
+                }
+                self.apply_event_outcome(outcome);
+            }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }
     }
 
-    /// Dispatches one event and returns all ordered follow-up work without
-    /// applying it. This is the migration boundary used by the individual
-    /// workflow modules.
     fn dispatch_workflow(&mut self, event: Event) -> anyhow::Result<EventOutcome> {
         self.log_event(&event);
         self.recording_manager.record.on_event(&event);
@@ -1029,6 +1039,11 @@ impl Reactor {
         }
 
         let should_update_notifications = Self::should_update_notifications(&event);
+        let duplicate_global_activation = matches!(
+            &event,
+            Event::ApplicationGloballyActivated(pid)
+                if self.main_window_tracker.is_globally_frontmost(*pid)
+        );
 
         let raised_window = self.main_window_tracker.handle_event(&event);
         match event {
@@ -1052,6 +1067,9 @@ impl Reactor {
                         window_server_info,
                     },
                 )?;
+                if self.main_window_tracker.is_globally_frontmost(pid) {
+                    outcome.app_requests.push((pid, Request::ApplicationGloballyActivated(pid)));
+                }
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
@@ -1070,6 +1088,9 @@ impl Reactor {
                 let mut outcome = application_workflow::handle_application_activated(
                     application_workflow::ApplicationActivatedPayload { pid, quiet },
                 )?;
+                if quiet == Quiet::No {
+                    outcome.absorb(self.handle_app_activation_workspace_switch(pid));
+                }
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
@@ -1080,21 +1101,25 @@ impl Reactor {
                 self.clear_menu_state_for_pid(pid);
             }
             Event::ApplicationGloballyActivated(pid) => {
+                if duplicate_global_activation {
+                    trace!(pid, "Ignoring duplicate global application activation");
+                    return Ok(EventOutcome::focus_changed(None, should_update_notifications));
+                }
                 self.clear_menu_state_for_non_owner(pid);
                 if !self.is_login_window_pid(pid) {
-                    self.request_visible_windows_for_pid(pid, false);
-                    if self.main_window_tracker.take_global_activation_quiet(pid) == Quiet::No {
-                        self.handle_app_activation_workspace_switch(pid);
-                    } else {
-                        debug!(
-                            pid,
-                            "Skipping auto workspace switch for quiet global activation (initiated by Rift)"
-                        );
+                    if let Some(app) = self.app_manager.apps.get(&pid) {
+                        let _ = app.handle.send(Request::ApplicationGloballyActivated(pid));
                     }
                 }
+                // The app thread will resolve the current AX main window and
+                // emit ApplicationActivated. Do not replay cached focus here.
+                return Ok(EventOutcome::focus_changed(None, should_update_notifications));
             }
             Event::WindowServerFocusChanged(window, reported_space) => {
                 if self.layout_manager.layout_engine.focused_window() == Some(window) {
+                    if let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
+                        _ = event_tap_tx.send(crate::actor::event_tap::Request::EnforceHidden);
+                    }
                     return Ok(EventOutcome::default());
                 }
                 if !self.state.windows.contains_window(window) {
@@ -1455,6 +1480,9 @@ impl Reactor {
                             })
                     })
                 });
+                let needs_layout_sync = window.is_some_and(|window| {
+                    self.layout_manager.layout_engine.focused_window() != Some(window)
+                });
                 return window_workflow::handle_mouse_moved_over_window(
                     &self.app_manager,
                     window_workflow::MouseMovedPayload {
@@ -1462,9 +1490,7 @@ impl Reactor {
                         should_sync: window
                             .is_some_and(|window| self.should_raise_on_mouse_over(window)),
                         is_main: window.is_some_and(|window| self.main_window() == Some(window)),
-                        needs_layout_sync: window.is_some_and(|window| {
-                            self.layout_manager.layout_engine.focused_window() != Some(window)
-                        }),
+                        needs_layout_sync,
                         active_space,
                     },
                 );
@@ -1589,12 +1615,16 @@ impl Reactor {
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::CloseWindow { window_server_id })) => {
-                return command_workflow::handle_close_window(window_server_id);
+                return command_workflow::handle_close_window(
+                    window_server_id.map(WindowServerId::new),
+                );
             }
             Event::Command(Command::Reactor(ReactorCommand::FocusWindow {
                 window_id,
                 window_server_id,
             })) => {
+                let window_id = WindowId::new(window_id.pid, window_id.idx);
+                let window_server_id = window_server_id.map(WindowServerId::new);
                 let resolved_space = self.best_space_for_window_id(window_id).or_else(|| {
                     self.state.windows.window(window_id).and_then(|window| {
                         self.best_space_for_window(&window.frame_monotonic, window.info.sys_id)
@@ -1817,10 +1847,6 @@ impl Reactor {
                 discovery.app_info,
             );
         }
-        if let Some(pid) = outcome.activate_application {
-            self.handle_app_activation_workspace_switch(pid);
-        }
-
         for window in outcome.reapply_app_rules {
             self.maybe_reapply_app_rules_for_window(window);
         }
@@ -1939,8 +1965,10 @@ impl Reactor {
                         self.workspace_switch_manager.workspace_switch_state,
                         WorkspaceSwitchState::Active
                     ),
+                    outcome.arrange.space_scope,
                 );
             }
+            // Publish the menu state once after all arrange passes have completed.
             self.maybe_send_menu_update();
         }
 
@@ -2000,7 +2028,7 @@ impl Reactor {
             }
         }
 
-        if let Some((config, keys_changed)) = outcome.service_config_update {
+        if let Some(config) = outcome.service_config_update {
             if let Some(tx) = &self.communication_manager.stack_line_tx
                 && let Err(error) = tx.try_send(stack_line::Event::ConfigUpdated(config.clone()))
             {
@@ -2011,7 +2039,7 @@ impl Reactor {
             {
                 warn!(%error, "failed to update menu bar config");
             }
-            if keys_changed && let Some(wm) = &self.communication_manager.wm_sender {
+            if let Some(wm) = &self.communication_manager.wm_sender {
                 wm.send(crate::actor::wm_controller::WmEvent::ConfigUpdated(config));
             }
         }
@@ -2059,6 +2087,9 @@ impl Reactor {
                 broadcast.new_title,
             );
         }
+        if let Some(window) = outcome.focused_window_broadcast {
+            self.broadcast_focused_window_changed(window);
+        }
         // Requests which schedule fresh discovery are last so observers see
         // the fully reconciled model, layout, UI, and broadcasts.
         for (pid, request) in outcome.app_requests {
@@ -2070,7 +2101,7 @@ impl Reactor {
         }
     }
 
-    fn create_window_data(&self, window_id: WindowId) -> Option<WindowData> {
+    fn create_window_data(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
         let window_state = self.state.windows.window(window_id)?;
         if !window_state.matches_filter(WindowFilter::EffectivelyManageable) {
             return None;
@@ -2080,7 +2111,7 @@ impl Reactor {
         let app_name = app.info.localized_name.clone();
         let bundle_id = app.info.bundle_id.clone();
 
-        Some(WindowData {
+        Some(RuntimeWindowData {
             id: window_id,
             is_floating: self.layout_manager.layout_engine.is_window_floating(window_id),
             is_focused: self.main_window() == Some(window_id),
@@ -2147,22 +2178,6 @@ impl Reactor {
         // Native-space membership/visibility is supplied separately by the spaces
         // actor; do not replace this with the global CG on-screen window list.
         self.request_visible_windows_for_apps(false);
-    }
-
-    fn request_visible_windows_for_pid(&mut self, pid: pid_t, track_mission_control_refresh: bool) {
-        if self.refreshes_blocked() {
-            self.defer_visible_refresh(track_mission_control_refresh);
-            return;
-        }
-
-        let sent = self
-            .app_manager
-            .apps
-            .get(&pid)
-            .is_some_and(|app| app.handle.send(Request::GetVisibleWindows).is_ok());
-        if sent && track_mission_control_refresh {
-            self.mission_control_manager.pending_mission_control_refresh.insert(pid);
-        }
     }
 
     fn request_visible_windows_for_apps(&mut self, track_mission_control_refresh: bool) {
@@ -2262,7 +2277,7 @@ impl Reactor {
             }
 
             self.refocus_manager.refocus_state = RefocusState::Pending(space);
-            self.update_layout_or_warn(false, false);
+            self.update_layout_or_warn(false, false, None);
             self.update_focus_follows_mouse_state();
         }
     }
@@ -2307,9 +2322,9 @@ impl Reactor {
             {
                 let display_uuid = self.display_uuid_for_space(space);
                 let broadcast_event = BroadcastEvent::WorkspaceChanged {
-                    workspace_id,
+                    workspace_id: protocol_workspace_id(workspace_id),
                     workspace_name,
-                    space_id: space,
+                    space_id: space.get(),
                     display_uuid,
                 };
                 _ = self.communication_manager.event_broadcaster.send(broadcast_event);
@@ -2339,13 +2354,38 @@ impl Reactor {
             let display_uuid = self.display_uuid_for_space(space);
 
             let event = BroadcastEvent::WindowTitleChanged {
-                window_id,
-                workspace_id,
+                window_id: protocol_window_id(window_id),
+                workspace_id: protocol_workspace_id(workspace_id),
                 workspace_index,
                 workspace_name,
                 previous_title,
                 new_title,
-                space_id: space,
+                space_id: space.get(),
+                display_uuid,
+            };
+            let _ = self.communication_manager.event_broadcaster.send(event);
+        }
+    }
+
+    fn broadcast_focused_window_changed(&self, window_id: WindowId) {
+        if let Some(space) = self.best_space_for_window_id(window_id)
+            && self.is_space_active(space)
+            && let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(space)
+        {
+            let workspace_index = self.layout_manager.layout_engine.active_workspace_idx(space);
+            let workspace_name = self
+                .layout_manager
+                .layout_engine
+                .workspace_name(space, workspace_id)
+                .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
+            let display_uuid = self.display_uuid_for_space(space);
+
+            let event = BroadcastEvent::FocusedWindowChanged {
+                window_id: protocol_window_id(window_id),
+                workspace_id: protocol_workspace_id(workspace_id),
+                workspace_index,
+                workspace_name,
+                space_id: space.get(),
                 display_uuid,
             };
             let _ = self.communication_manager.event_broadcaster.send(event);
@@ -3228,6 +3268,15 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        let focus_changed = matches!(
+            &event,
+            LayoutEvent::WindowFocused(_, window)
+                if self.layout_manager.layout_engine.focused_window() != Some(*window)
+        );
+        let event_space = match &event {
+            LayoutEvent::WindowFocused(space, _) => Some(*space),
+            _ => None,
+        };
         let focus_desktop = matches!(
             event,
             LayoutEvent::WindowRemoved(wid)
@@ -3236,8 +3285,15 @@ impl Reactor {
         let event_clone = event.clone();
         let response =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
+        if focus_changed && let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
+            _ = event_tap_tx.send(crate::actor::event_tap::Request::HideOnFocus);
+        }
+        let geometry_changed = response.changed;
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, None);
+        if geometry_changed {
+            self.update_layout_or_warn(false, false, event_space);
+        }
         if focus_desktop && let Some(space) = self.workspace_command_space() {
             self.focus_desktop_if_active_workspace_empty(space);
         }
@@ -3487,17 +3543,13 @@ impl Reactor {
         }
     }
 
-    fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) {
-        use objc2_app_kit::NSRunningApplication;
-
-        use crate::sys::app::NSRunningApplicationExt;
-
+    fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) -> EventOutcome {
         if self.workspace_switch_manager.active_workspace_switch.is_some() {
             trace!(
                 "Skipping auto workspace switch for pid {} because a workspace switch is in progress",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if self.workspace_switch_manager.manual_switch_in_progress() {
@@ -3505,7 +3557,7 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because a manual switch is in progress",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if let Some(active_space) = self.raw_command_space()
@@ -3515,7 +3567,7 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because the active space is fullscreen",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if let Some(wsid) = self.activation_from_unmanageable_window(pid) {
@@ -3524,52 +3576,21 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because the activated window is not manageable",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
-        let visible_spaces: HashSet<SpaceId> = self.iter_active_spaces().collect();
-        let app_is_on_visible_workspace =
-            self.state.windows.iter_windows().any(|(wid, _window_state)| {
-                if wid.pid != pid {
-                    return false;
-                }
-                let Some(space) = self.best_space_for_window_id(wid) else {
-                    return false;
-                };
-                if !visible_spaces.contains(&space) {
-                    return false;
-                }
-                let Some(active_workspace) =
-                    self.layout_manager.layout_engine.active_workspace(space)
-                else {
-                    return false;
-                };
-                self.layout_manager
-                    .layout_engine
-                    .virtual_workspace_manager()
-                    .workspace_for_window(&self.state.windows, space, wid)
-                    .is_some_and(|window_workspace| window_workspace == active_workspace)
-            });
-
-        if app_is_on_visible_workspace {
-            debug!("App {} is already on a visible workspace, not switching.", pid);
-            return;
-        }
-
-        let Some(app) = NSRunningApplication::with_process_id(pid) else {
-            return;
+        let Some(bundle_id_str) =
+            self.app_manager.apps.get(&pid).and_then(|app| app.info.bundle_id.clone())
+        else {
+            return EventOutcome::no_change();
         };
-        let Some(bundle_id) = app.bundle_id() else {
-            return;
-        };
-        let bundle_id_str = bundle_id.to_string();
 
         if self.config.settings.auto_focus_blacklist.contains(&bundle_id_str) {
             debug!(
                 "App {} is blacklisted for auto-focus workspace switching, ignoring activation",
                 bundle_id_str
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         debug!(
@@ -3577,25 +3598,22 @@ impl Reactor {
             bundle_id_str, pid
         );
 
-        let app_window = self
-            .main_window()
-            .filter(|wid| wid.pid == pid && self.window_is_standard(*wid))
-            .or_else(|| {
-                self.state
-                    .windows
-                    .window_ids_for_pid(pid)
-                    .find(|wid| self.window_is_standard(*wid))
-            });
+        // Carbon activation is reconciled by the app thread before this runs,
+        // so a missing main window means there is no authoritative switch
+        // target. Picking an arbitrary window for the process is especially
+        // unsafe for apps whose windows span multiple virtual workspaces.
+        let app_window =
+            self.main_window().filter(|wid| wid.pid == pid && self.window_is_standard(*wid));
 
         let Some(app_window_id) = app_window else {
-            return;
+            return EventOutcome::no_change();
         };
 
         let Some(window_space) = self.best_space_for_window_id(app_window_id) else {
-            return;
+            return EventOutcome::no_change();
         };
 
-        self.maybe_auto_switch_to_window_workspace(pid, app_window_id, window_space);
+        self.maybe_auto_switch_to_window_workspace(pid, app_window_id, window_space)
     }
 
     fn maybe_auto_switch_to_window_workspace(
@@ -3603,18 +3621,18 @@ impl Reactor {
         pid: pid_t,
         app_window_id: WindowId,
         window_space: SpaceId,
-    ) {
+    ) -> EventOutcome {
         let workspace_state = self.layout_manager.layout_engine.virtual_workspace_manager();
         let Some(window_workspace) =
             workspace_state.workspace_for_window(&self.state.windows, window_space, app_window_id)
         else {
-            return;
+            return EventOutcome::no_change();
         };
 
         let Some(current_workspace) =
             self.layout_manager.layout_engine.active_workspace(window_space)
         else {
-            return;
+            return EventOutcome::no_change();
         };
 
         if window_workspace != current_workspace {
@@ -3641,10 +3659,12 @@ impl Reactor {
                     workspace_index,
                     app_window_id,
                 );
-                self.handle_layout_response(response, Some(window_space));
-                self.update_event_tap_layout_mode();
+                return EventOutcome::layout_changed(false)
+                    .with_layout_response(response, Some(window_space));
             }
         }
+
+        EventOutcome::no_change()
     }
 
     fn handle_layout_response(
@@ -3663,6 +3683,7 @@ impl Reactor {
                 RefocusState::None => None,
             };
         let layout::EventResponse {
+            changed: _,
             raise_windows,
             mut focus_window,
             boundary_hit,
@@ -4286,7 +4307,7 @@ impl Reactor {
         self.mission_control_manager.pending_mission_control_refresh.clear();
         self.force_refresh_all_windows();
         self.check_for_new_windows();
-        self.update_layout_or_warn(false, false);
+        self.update_layout_or_warn(false, false, None);
         self.maybe_send_menu_update();
     }
 
@@ -4504,19 +4525,27 @@ impl Reactor {
         &mut self,
         is_resize: bool,
         is_workspace_switch: bool,
+        space_scope: Option<SpaceId>,
     ) -> bool {
-        self.update_layout_or_warn_with(is_resize, is_workspace_switch, "Layout update failed")
+        self.update_layout_or_warn_with(
+            is_resize,
+            is_workspace_switch,
+            space_scope,
+            "Layout update failed",
+        )
     }
 
     pub(crate) fn update_layout_or_warn_with(
         &mut self,
         is_resize: bool,
         is_workspace_switch: bool,
+        space_scope: Option<SpaceId>,
         context: &'static str,
     ) -> bool {
-        LayoutManager::update_layout(self, is_resize, is_workspace_switch).unwrap_or_else(|e| {
-            warn!(error = ?e, "{}", context);
-            false
-        })
+        LayoutManager::update_layout(self, is_resize, is_workspace_switch, space_scope)
+            .unwrap_or_else(|e| {
+                warn!(error = ?e, "{}", context);
+                false
+            })
     }
 }
