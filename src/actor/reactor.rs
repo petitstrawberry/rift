@@ -1313,7 +1313,32 @@ impl Reactor {
                 );
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
-                let effective_mouse_state = mouse_state.or_else(crate::sys::event::get_mouse_state);
+                let mission_control_active = self.is_mission_control_active();
+                let mut effective_mouse_state = mouse_state;
+                if matches!(
+                    window_workflow::classify_window_frame_change(
+                        &mut self.state,
+                        &self.transaction_manager,
+                        &mut self.drag_manager,
+                        wid,
+                        new_frame,
+                        last_seen,
+                        requested.0,
+                        &mut effective_mouse_state,
+                        mission_control_active,
+                    ),
+                    window_workflow::FrameChangeDisposition::Handled
+                ) {
+                    let mut outcome = EventOutcome::no_change();
+                    outcome.dispatch_mouse_up = effective_mouse_state
+                        == Some(crate::sys::event::MouseState::Up)
+                        && matches!(
+                            self.drag_manager.drag_state,
+                            DragState::Active { .. } | DragState::PendingSwap { .. }
+                        );
+                    outcome.focused_window = raised_window;
+                    return Ok(outcome);
+                }
                 let (server_id, old_frame) = self
                     .state
                     .windows
@@ -1351,19 +1376,14 @@ impl Reactor {
                         Some((screen.space?, screen.frame, screen.display_uuid_owned()))
                     })
                     .collect();
-                let mission_control_active = self.is_mission_control_active();
                 let mut outcome = window_workflow::handle_window_frame_changed(
                     &mut self.state,
                     &mut self.layout_manager,
-                    &self.transaction_manager,
                     &mut self.drag_manager,
                     window_workflow::WindowFrameChangedPayload {
                         window: wid,
                         new_frame,
-                        last_seen,
-                        requested,
                         mouse_state: effective_mouse_state,
-                        mission_control_active,
                         old_space,
                         new_space,
                         old_space_active,
@@ -3320,6 +3340,11 @@ impl Reactor {
                 workspace_switch_space.is_some(),
                 workspace_switch_space.or(event_space),
             );
+        } else if let Some(space) = event_space {
+            // Selecting another child in a traditional stack changes no
+            // frames, so no layout pass follows. Publish the new selected
+            // segment explicitly for stack-line click/hover focus.
+            LayoutManager::publish_stack_line_for_space(self, space);
         }
         if focus_desktop && let Some(space) = self.workspace_command_space() {
             self.focus_desktop_if_active_workspace_empty(space);
@@ -3984,6 +4009,7 @@ impl Reactor {
             focus_window: focus_window_with_warp,
             app_handles,
             focus_quiet,
+            focus_confirmation: crate::actor::app::FocusConfirmation::AxImmediate,
         });
 
         if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
