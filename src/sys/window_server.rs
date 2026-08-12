@@ -459,22 +459,24 @@ pub fn window_space(id: WindowServerId) -> Option<crate::sys::screen::SpaceId> {
         .or_else(|| spaces.into_iter().next())
 }
 
-pub fn window_is_ordered_in(id: WindowServerId) -> bool {
+pub fn window_ordered_in(id: WindowServerId) -> Option<bool> {
     #[cfg(test)]
     if let Some(ordered) = TEST_WINDOW_ORDERED_IN_OVERRIDE
         .with(|override_ordered| override_ordered.borrow().get(&id.as_u32()).copied())
     {
-        return ordered;
+        return Some(ordered);
     }
 
     let mut ordered: u8 = 0;
     if let Ok(_) = cg_ok(unsafe { SLSWindowIsOrderedIn(*G_CONNECTION, id.as_u32(), &mut ordered) })
     {
-        return ordered != 0;
+        return Some(ordered != 0);
     }
 
-    false
+    None
 }
+
+pub fn window_is_ordered_in(id: WindowServerId) -> bool { window_ordered_in(id).unwrap_or(false) }
 
 fn get_windows_raw<T: Type>(
     options: CGWindowListOption,
@@ -870,16 +872,18 @@ pub fn set_window_ordered_in_override(id: WindowServerId, ordered: Option<bool>)
     });
 }
 
-pub fn app_window_suitable(id: WindowServerId) -> bool {
-    let Some(query) = WindowIterator::new(&[id]) else {
-        return false;
-    };
+pub fn app_window_suitability(id: WindowServerId) -> Option<bool> {
+    let query = WindowIterator::new(&[id])?;
 
     if query.count() > 0 && query.advance().is_some() {
-        iterator_window_suitable(query.iter)
+        Some(iterator_window_suitable(query.iter))
     } else {
-        false
+        Some(false)
     }
+}
+
+pub fn app_window_suitable(id: WindowServerId) -> bool {
+    app_window_suitability(id).unwrap_or(false)
 }
 
 pub fn space_is_user(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 0 } }
