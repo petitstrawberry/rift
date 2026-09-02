@@ -493,6 +493,20 @@ impl Reactor {
             .extend(self.window_inventory_manager.in_flight.keys().copied());
     }
 
+    fn abandon_window_inventories_from_instability(&mut self) {
+        // AX requests issued before sleep or display teardown are not guaranteed to
+        // reply. Keeping them in `in_flight` prevents the authoritative recovery
+        // snapshot from requesting replacement AX elements, leaving every affected
+        // window unusable until its application is activated manually.
+        let abandoned = self
+            .window_inventory_manager
+            .in_flight
+            .drain()
+            .map(|(pid, _)| pid)
+            .collect::<Vec<_>>();
+        self.window_inventory_manager.pending.extend(abandoned);
+    }
+
     fn request_window_inventory(&mut self, pid: pid_t) {
         if self.refreshes_blocked() || self.window_inventory_manager.in_flight.contains_key(&pid) {
             self.window_inventory_manager.pending.insert(pid);
@@ -1538,13 +1552,28 @@ impl Reactor {
                     space_state.releases_lifecycle_refresh_quarantine;
                 let releases_display_churn_refresh_quarantine =
                     space_state.releases_display_churn_refresh_quarantine;
-                let outcome = self.handle_authoritative_space_snapshot(space_state)?;
+                let releases_instability = (releases_lifecycle_refresh_quarantine
+                    && (self.refresh_quarantine_manager.awaiting_post_wake_snapshot
+                        || self.refresh_quarantine_manager.awaiting_post_session_snapshot))
+                    || (releases_display_churn_refresh_quarantine
+                        && self.refresh_quarantine_manager.display_churn_active);
+                if releases_instability {
+                    self.abandon_window_inventories_from_instability();
+                }
+                let mut outcome = self.handle_authoritative_space_snapshot(space_state)?;
                 if releases_lifecycle_refresh_quarantine {
                     self.release_post_instability_quarantine_after_authoritative_snapshot();
                 }
                 if releases_display_churn_refresh_quarantine {
                     self.refresh_quarantine_manager.display_churn_active = false;
                     self.request_refresh_when_spaces_actor_stabilizes();
+                }
+                if releases_instability {
+                    // Releasing either recovery gate already flushes the deferred
+                    // all-app refresh. A topology-changing snapshot requests the
+                    // same refresh through its outcome; leave only one request per
+                    // app instead of immediately scheduling a redundant follow-up.
+                    outcome.refresh_window_inventories = false;
                 }
                 return Ok(outcome);
             }
@@ -2119,6 +2148,11 @@ impl Reactor {
                 outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
             );
         }
+        if outcome.broadcast_selection_changed {
+            self.broadcast_selection_changed(
+                outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
+            );
+        }
 
         if layout_changed
             && let Some(window) = outcome.post_arrange_mouse_warp
@@ -2515,6 +2549,18 @@ impl Reactor {
     }
 
     fn broadcast_layout_changed(&self, space: Option<SpaceId>) {
+        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::LayoutChanged);
+    }
+
+    fn broadcast_selection_changed(&self, space: Option<SpaceId>) {
+        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::SelectionChanged);
+    }
+
+    fn broadcast_layout_state_changed(
+        &self,
+        space: Option<SpaceId>,
+        kind: rift_protocol::EventKind,
+    ) {
         if let Some(space) = space
             && self.is_space_active(space)
             && let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(space)
@@ -2526,13 +2572,27 @@ impl Reactor {
                 .layout_engine
                 .workspace_name(space, workspace_id)
                 .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
-            let event = BroadcastEvent::LayoutChanged {
-                workspace_id: protocol_workspace_id(workspace_id),
-                workspace_index,
-                workspace_name,
-                space_id: space.get(),
-                display_uuid: self.display_uuid_for_space(space),
-                layout,
+            let workspace_id = protocol_workspace_id(workspace_id);
+            let space_id = space.get();
+            let display_uuid = self.display_uuid_for_space(space);
+            let event = match kind {
+                rift_protocol::EventKind::LayoutChanged => BroadcastEvent::LayoutChanged {
+                    workspace_id,
+                    workspace_index,
+                    workspace_name,
+                    space_id,
+                    display_uuid,
+                    layout,
+                },
+                rift_protocol::EventKind::SelectionChanged => BroadcastEvent::SelectionChanged {
+                    workspace_id,
+                    workspace_index,
+                    workspace_name,
+                    space_id,
+                    display_uuid,
+                    layout,
+                },
+                _ => return,
             };
             let _ = self.communication_manager.event_broadcaster.send(event);
         }

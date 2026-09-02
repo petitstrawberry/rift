@@ -31,6 +31,10 @@ fn layout_query_exposes_active_and_inactive_workspace_container_trees() {
         rift_protocol::ContainerNodeType::Container
     );
     assert_eq!(state.container_tree.children.len(), 2);
+    assert!(state.container_tree.frame.size.width > 0.0);
+    assert!(state.container_tree.frame.size.height > 0.0);
+    assert!(state.container_tree.children.iter().all(|node| node.frame.size.width > 0.0));
+    assert!(state.container_tree.children.iter().all(|node| node.frame.size.height > 0.0));
     assert_eq!(
         state
             .container_tree
@@ -4372,6 +4376,113 @@ fn wake_gate_waits_for_fresh_space_snapshot_before_refresh() {
 }
 
 #[test]
+fn post_wake_snapshot_replaces_an_inventory_that_never_replied() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let pid = 91;
+    let (app_tx, mut app_rx) = actor::channel();
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.app_manager.apps.insert(pid, AppState {
+        info: AppInfo {
+            bundle_id: Some("com.test.wake-inventory".into()),
+            localized_name: Some("Wake Inventory".into()),
+        },
+        handle: AppThreadHandle::new_for_test(app_tx),
+    });
+
+    reactor.request_window_inventory(pid);
+    let (_, Request::RefreshWindowInventory(stale_token)) =
+        app_rx.try_recv().expect("the initial inventory should be requested")
+    else {
+        panic!("expected a window inventory request");
+    };
+
+    reactor.handle_event(Event::SystemWillSleep);
+    reactor.handle_event(Event::SystemWoke);
+    let fresh_snapshot = space_state_event_with(vec![screen], vec![Some(space)], |state| {
+        state.releases_lifecycle_refresh_quarantine = true;
+        state.should_force_refresh_layout = true;
+    });
+    reactor.handle_event(fresh_snapshot);
+
+    let (_, Request::RefreshWindowInventory(fresh_token)) = app_rx
+        .try_recv()
+        .expect("wake recovery must replace an inventory that never replied")
+    else {
+        panic!("expected a replacement window inventory request");
+    };
+    assert_ne!(fresh_token.request_id, stale_token.request_id);
+
+    let stale_window = WindowId::new(pid, 1);
+    reactor.handle_event(Event::WindowsDiscovered {
+        pid,
+        token: stale_token,
+        successful: true,
+        new: vec![(
+            stale_window,
+            make_window_info(screen, None, "Stale Window", None),
+        )],
+        known_visible: vec![stale_window],
+    });
+    assert!(
+        !reactor.state.windows.contains_window(stale_window),
+        "a late reply from the abandoned request must not mutate recovery state",
+    );
+    assert_eq!(
+        reactor.window_inventory_manager.in_flight.get(&pid),
+        Some(&fresh_token),
+        "a late stale reply must not clear the replacement request",
+    );
+    assert!(
+        app_rx.try_recv().is_err(),
+        "discarding the abandoned reply must not enqueue a third inventory",
+    );
+}
+
+#[test]
+fn ordinary_snapshot_does_not_abandon_current_inventory() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let pid = 92;
+    let (app_tx, mut app_rx) = actor::channel();
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.app_manager.apps.insert(pid, AppState {
+        info: AppInfo {
+            bundle_id: Some("com.test.ordinary-inventory".into()),
+            localized_name: Some("Ordinary Inventory".into()),
+        },
+        handle: AppThreadHandle::new_for_test(app_tx),
+    });
+
+    reactor.request_window_inventory(pid);
+    let (_, Request::RefreshWindowInventory(token)) =
+        app_rx.try_recv().expect("the initial inventory should be requested")
+    else {
+        panic!("expected a window inventory request");
+    };
+
+    let snapshot = space_state_event_with(vec![screen], vec![Some(space)], |state| {
+        // Spaces marks every coherent snapshot as a display-churn acknowledgement,
+        // even when no churn is active.
+        state.releases_display_churn_refresh_quarantine = true
+    });
+    reactor.handle_event(snapshot);
+
+    assert_eq!(
+        reactor.window_inventory_manager.in_flight.get(&pid),
+        Some(&token)
+    );
+    assert!(
+        app_rx.try_recv().is_err(),
+        "an ordinary snapshot must not replace an unrelated current inventory",
+    );
+}
+
+#[test]
 fn partial_post_wake_snapshot_preserves_manual_workspace_assignment() {
     let (mut apps, mut reactor) = test_context_with_workspace_count(2);
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
@@ -4685,6 +4796,14 @@ fn sleep_ax_churn_preserves_modified_layout_through_recovery() {
 
 #[test]
 fn clamshell_sleep_preserves_nested_layout_across_display_replacement() {
+    fn without_frames(
+        mut node: rift_protocol::ContainerTreeNode,
+    ) -> rift_protocol::ContainerTreeNode {
+        node.frame = Default::default();
+        node.children = node.children.into_iter().map(without_frames).collect();
+        node
+    }
+
     let (mut apps, mut reactor) = test_context();
     let external_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(3440., 1409.));
     let internal_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1728., 1083.));
@@ -4714,11 +4833,13 @@ fn clamshell_sleep_preserves_nested_layout_across_display_replacement() {
     }
 
     assert_eq!(
-        reactor
-            .query_layout_state(Some(space.get()), None)
-            .expect("quarantined layout state")
-            .container_tree,
-        topology_before,
+        without_frames(
+            reactor
+                .query_layout_state(Some(space.get()), None)
+                .expect("quarantined layout state")
+                .container_tree,
+        ),
+        without_frames(topology_before.clone()),
         "sleep-time AX destruction must not flatten the nested layout",
     );
 
@@ -4741,11 +4862,13 @@ fn clamshell_sleep_preserves_nested_layout_across_display_replacement() {
     reactor.discover_test_windows(1, rediscovered, window_ids.clone());
 
     assert_eq!(
-        reactor
-            .query_layout_state(Some(space.get()), None)
-            .expect("internal-display layout state")
-            .container_tree,
-        topology_before,
+        without_frames(
+            reactor
+                .query_layout_state(Some(space.get()), None)
+                .expect("internal-display layout state")
+                .container_tree,
+        ),
+        without_frames(topology_before),
         "clamshell recovery must preserve container nesting, order, selection, and weights",
     );
     assert_eq!(
